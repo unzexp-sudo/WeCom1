@@ -4,7 +4,7 @@ Sits between WeCom and the ERP. It receives messages, dedupes them, figures out
 which ERP customer sent them, downloads attachments, and hands everything to the
 ERP intake pipeline. It never parses an order itself.
 
-Run:  cd wecom-gateway && python -m uvicorn app.main:app --reload --port 8100
+Run:  cd WeCom1 && python -m uvicorn app.main:app --reload --port 8100
 """
 from __future__ import annotations
 
