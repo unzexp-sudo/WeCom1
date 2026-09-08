@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets (keep .env.example tracked)
+.env
+
+# Runtime data: SQLite DB, media, mock archives, outbox
+data/
+
+# OS
+.DS_Store
