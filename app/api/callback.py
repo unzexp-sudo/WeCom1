@@ -134,12 +134,15 @@ def _from_app_callback(payload: dict[str, Any]) -> dict[str, Any]:
 
     entry: dict[str, Any] = {
         "msgid": payload.get("MsgId"),
-        # No roomid and no recipient list on an app callback: the sender IS
-        # `FromUserName`, so leave `tolist` empty and let identity resolve the
-        # external contact from `from` (see ingestor.normalize_entry).
+        # When the app is added to a group and a user @-mentions it, WeCom
+        # delivers the message with a `RoomId` field (PascalCase here, lowercase
+        # `roomid` downstream). Carry it through so the ingestor classifies the
+        # message as a GROUP message (chat_id = roomid) and routes it via the
+        # group, not as a 1:1 DM. Absent in a real 1:1 DM callback, so default
+        # to "" and let identity resolve the external contact from `from`.
         "from": payload.get("FromUserName"),
         "tolist": [],
-        "roomid": "",
+        "roomid": payload.get("RoomId") or "",
         "msgtype": archived,
         "msgtime": created * 1000 if created else None,
     }
