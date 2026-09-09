@@ -162,11 +162,15 @@ class SdkDecryptor:
         self._ctypes = ctypes
         self._lib = lib
 
-        if not (settings.corp_id and settings.secret):
-            raise DecryptError("WECOM_CORP_ID and WECOM_SECRET are required for the SDK path")
+        if not (settings.corp_id and (settings.archive_secret or settings.secret)):
+            raise DecryptError(
+                "WECOM_CORP_ID and (WECOM_ARCHIVE_SECRET or WECOM_SECRET) are required for the SDK path"
+            )
 
+        # The SDK Init() secret is the 会话内容存档 secret, not the app secret.
+        sdk_secret = (settings.archive_secret or settings.secret)
         sdk = lib.NewSdk()
-        rc = lib.Init(sdk, settings.corp_id.encode(), settings.secret.encode())
+        rc = lib.Init(sdk, settings.corp_id.encode(), sdk_secret.encode())
         if rc != 0:
             raise DecryptError(f"WeCom SDK Init failed with code {rc}")
         self._sdk = sdk

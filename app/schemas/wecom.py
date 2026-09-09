@@ -18,6 +18,7 @@ TemplateName = Literal[
     "order_confirmed",
     "needs_customer_confirm",
     "parse_failed",
+    "intake_needs_review",
     "out_for_delivery",
     "delivered",
     "invoice_ready",

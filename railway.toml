@@ -1,7 +1,9 @@
 [build]
-builder = "NIXPACKS"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
+# PORT is injected by Railway at runtime.
 startCommand = "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8100}"
 healthcheckPath = "/wecom/health"
 healthcheckTimeout = 30

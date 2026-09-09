@@ -75,6 +75,25 @@ TEMPLATES: dict[str, dict[str, str]] = {
             "我们已通知客服跟进，稍后会与您确认订单内容。"
         ),
     },
+    # --- intake needs review (internal ops alert) --------------------------
+    "intake_needs_review": {
+        "en": (
+            "A new order is waiting for human review (ref {document_id}).\n"
+            "Source: {source_type}\n"
+            "File: {filename}\n"
+            "\n"
+            "Open the ERP, check the extracted lines, then confirm. "
+            "No order is created until someone confirms it."
+        ),
+        "zh": (
+            "有一张新订单等待人工核对（编号 {document_id}）。\n"
+            "来源：{source_type}\n"
+            "文件：{filename}\n"
+            "\n"
+            "请打开 ERP 核对识别结果，确认无误后再提交。"
+            "在您确认之前，系统不会生成正式订单。"
+        ),
+    },
     # --- out for delivery --------------------------------------------------
     "out_for_delivery": {
         "en": (

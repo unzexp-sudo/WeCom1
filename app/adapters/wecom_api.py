@@ -119,18 +119,22 @@ class RealWeComApi:
 
     # --- token -------------------------------------------------------------
 
-    def get_access_token(self, force: bool = False) -> str:
+    def get_access_token(self, force: bool = False, *, use_archive_secret: bool = False) -> str:
         now = time.time()
         if not force and self._token and now < self._token_expires_at:
             return self._token
-        if not (settings.corp_id and settings.secret):
+        # The Session Archive (`msgaudit`) API needs the 会话内容存档 secret,
+        # which differs from the self-built-app secret used for outbound send.
+        secret = settings.archive_secret if use_archive_secret else settings.secret
+        if not (settings.corp_id and secret):
+            which = "WECOM_ARCHIVE_SECRET" if use_archive_secret else "WECOM_SECRET"
             raise WeComApiError(
-                "WECOM_CORP_ID / WECOM_SECRET are not configured — cannot fetch access_token"
+                f"WECOM_CORP_ID / {which} are not configured — cannot fetch access_token"
             )
         with _client() as c:
             r = c.get(
                 f"{WECOM_API_BASE}/gettoken",
-                params={"corpid": settings.corp_id, "corpsecret": settings.secret},
+                params={"corpid": settings.corp_id, "corpsecret": secret},
             )
             data = r.json()
         if data.get("errcode"):
@@ -147,7 +151,7 @@ class RealWeComApi:
         with _client() as c:
             r = c.post(
                 f"{WECOM_API_BASE}/msgaudit/get_chat_data",
-                params={"access_token": self.get_access_token()},
+                params={"access_token": self.get_access_token(use_archive_secret=True)},
                 json={"seq": seq, "limit": limit, "timeout": timeout},
             )
             payload = r.json()
@@ -156,11 +160,11 @@ class RealWeComApi:
         if errcode:
             # 41001-ish / expired token → refresh once and retry
             if errcode in (40014, 42001, 42007, 42009):
-                self.get_access_token(force=True)
+                self.get_access_token(force=True, use_archive_secret=True)
                 with _client() as c:
                     r = c.post(
                         f"{WECOM_API_BASE}/msgaudit/get_chat_data",
-                        params={"access_token": self.get_access_token()},
+                        params={"access_token": self.get_access_token(use_archive_secret=True)},
                         json={"seq": seq, "limit": limit, "timeout": timeout},
                     )
                     payload = r.json()

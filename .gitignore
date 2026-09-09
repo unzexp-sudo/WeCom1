@@ -14,3 +14,11 @@ data/
 
 # OS
 .DS_Store
+
+# WeCom finance SDK binary + Session-Archive RSA private key — never commit.
+# The .so is fetched at build from WeCom's CDN; the key is mounted from a
+# Railway Volume at runtime. If you drop them locally for testing, keep them out
+# of git.
+libWeWorkFinanceSdk.so
+archive_private_key.pem
+*.pem

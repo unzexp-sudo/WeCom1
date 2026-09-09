@@ -1,4 +1,4 @@
-"""app/templates/messages.py — the six bilingual templates (§7). Owner: agent [B]."""
+"""app/templates/messages.py — the bilingual templates (§7). Owner: agent [B]."""
 from __future__ import annotations
 
 import pytest
@@ -12,6 +12,7 @@ TEMPLATE_NAMES = [
     "order_confirmed",
     "needs_customer_confirm",
     "parse_failed",
+    "intake_needs_review",
     "out_for_delivery",
     "delivered",
     "invoice_ready",
@@ -30,6 +31,11 @@ SAMPLE_PAYLOADS = {
         "reason": "价格待确认",
     },
     "parse_failed": {"msgid": "wmMsgText0001", "error": "无法识别商品"},
+    "intake_needs_review": {
+        "document_id": "7effab01-1aaa-4776-9942-d4cda198182c",
+        "source_type": "text",
+        "filename": "order.txt",
+    },
     "out_for_delivery": {"order_number": "ORD-20260908-0001", "driver": "陈师傅", "eta": "09:30"},
     "delivered": {
         "order_number": "ORD-20260908-0001",

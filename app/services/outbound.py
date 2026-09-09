@@ -193,7 +193,15 @@ def send_message(db: Session, req: SendRequest, *, api=None) -> SendResponse:
                 error=NO_DESTINATION,
             )
 
-        if settings.is_live:
+        # The allowlist guards against a mis-resolved *customer* destination
+        # receiving someone else's order. An internal ops ping carries no
+        # customer and targets an admin-configured group, so it is not the
+        # risk the allowlist exists for. Without this exemption the team would
+        # silently stop receiving review alerts the moment live mode turned on.
+        is_internal_alert = (
+            bool(req.chat_id) and not req.customer_id and not req.external_userid
+        )
+        if settings.is_live and not is_internal_alert:
             blocked = allowlist_error(to_id)
             if blocked:
                 log.status = "blocked"
