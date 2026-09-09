@@ -66,10 +66,11 @@ def verify_signature(
     return make_signature(timestamp, nonce, encrypt, token) == signature
 
 
-def _aes_key() -> bytes:
-    raw = (settings.encoding_aes_key or "").strip()
+def _aes_key_from(raw: str) -> bytes:
+    """Resolve an EncodingAESKey string into a 32-byte AES key."""
+    raw = (raw or "").strip()
     if not raw:
-        raise CallbackCryptoError("WECOM_ENCODING_AES_KEY is not configured")
+        raise CallbackCryptoError("EncodingAESKey is not configured")
     padded = raw + "="
     try:
         key = base64.b64decode(padded)
@@ -82,6 +83,10 @@ def _aes_key() -> bytes:
     return key
 
 
+def _aes_key() -> bytes:
+    return _aes_key_from(settings.encoding_aes_key)
+
+
 def _pkcs7_unpad(data: bytes) -> bytes:
     if not data:
         return data
@@ -91,24 +96,27 @@ def _pkcs7_unpad(data: bytes) -> bytes:
     return data[:-pad]
 
 
-def decrypt(encrypted_body_b64: str) -> str:
-    """Decrypt an AES-256-CBC WeCom callback body. Returns plaintext XML/JSON."""
+def _decrypt_with_key(encrypted_body_b64: str, aes_key: bytes) -> tuple[bytes, str]:
+    """Decrypt a WeCom callback body with an explicit AES key.
+
+    Returns (plaintext_bytes, receiveid). The 16-byte random prefix and the
+    4-byte big-endian length are stripped; the appended receiveid is preserved
+    so callers can validate it themselves.
+    """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-    key = _aes_key()
     try:
         ciphertext = base64.b64decode(encrypted_body_b64)
     except (binascii.Error, ValueError) as exc:
         raise CallbackCryptoError(f"Body is not valid base64: {exc}") from exc
 
-    decryptor = Cipher(algorithms.AES(key), modes.CBC(key[:16])).decryptor()
+    decryptor = Cipher(algorithms.AES(aes_key), modes.CBC(aes_key[:16])).decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
     plain = _pkcs7_unpad(padded)
 
     if len(plain) < 20:
         raise CallbackCryptoError("Decrypted payload too short")
 
-    # 16-byte random prefix, then 4-byte big-endian length, then message
     content_len = struct.unpack("!I", plain[16:20])[0]
     if 20 + content_len > len(plain):
         raise CallbackCryptoError(
@@ -116,6 +124,14 @@ def decrypt(encrypted_body_b64: str) -> str:
         )
 
     receiveid = plain[20 + content_len :].decode("utf-8", errors="replace")
+    return plain[20 : 20 + content_len], receiveid
+
+
+def decrypt(encrypted_body_b64: str) -> str:
+    """Decrypt an AES-256-CBC WeCom callback body. Returns plaintext XML/JSON."""
+    key = _aes_key()
+    plain_bytes, receiveid = _decrypt_with_key(encrypted_body_b64, key)
+
     expected = (settings.corp_id or "").strip()
     if expected and receiveid and receiveid != expected:
         # See the module docstring: logged, not rejected, on purpose.
@@ -123,7 +139,32 @@ def decrypt(encrypted_body_b64: str) -> str:
             "Callback receiveid %r does not match WECOM_CORP_ID %r", receiveid, expected
         )
 
-    return plain[20 : 20 + content_len].decode("utf-8", errors="replace")
+    return plain_bytes.decode("utf-8", errors="replace")
+
+
+def decrypt_with(
+    encrypted_body_b64: str,
+    *,
+    aes_key: str,
+    receiveid: str = "",
+) -> str:
+    """Decrypt a callback body with an explicit AES key (no settings lookup).
+
+    Used by the smart-bot (智能机器人) callback, which has separate credentials
+    (WECOM_BOT_TOKEN / WECOM_BOT_ENCODING_AES_KEY) and does not use the corp
+    ID as its receiveid. `receiveid` is checked-and-logged-only when supplied,
+    matching the self-built-app behaviour.
+    """
+    key = _aes_key_from(aes_key)
+    plain_bytes, plain_receiveid = _decrypt_with_key(encrypted_body_b64, key)
+
+    expected = (receiveid or "").strip()
+    if expected and plain_receiveid and plain_receiveid != expected:
+        logger.warning(
+            "Callback receiveid %r does not match expected %r", plain_receiveid, expected
+        )
+
+    return plain_bytes.decode("utf-8", errors="replace")
 
 
 def encrypt(plaintext: str) -> str:

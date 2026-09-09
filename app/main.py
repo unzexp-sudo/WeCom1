@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from app.api import callback, contacts, groups, health, messages, send
+from app.api import bot_callback, callback, contacts, groups, health, messages, send
 from app.core.config import settings
 from app.core.database import init_db
 
@@ -74,7 +74,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (health, callback, messages, contacts, groups, send):
+for module in (health, callback, bot_callback, messages, contacts, groups, send):
     app.include_router(module.router)
 
 
