@@ -57,6 +57,17 @@ class Settings(BaseSettings):
     bot_reply_enabled: bool = True
     bot_reply_text: str = ""
 
+    # --- Smart-bot internal senders -----------------------------------------
+    # The internal-sender filter exists to keep AMBIENT staff chatter out of the
+    # order queue. A smart bot never sees ambient chatter: WeCom only delivers
+    # messages in which the bot is @-mentioned, so every bot message is already
+    # a deliberate act. Without this our own staff could never test the bot in
+    # an internal group — their order would be dropped as "internal" and the
+    # bot would stay silent. Nothing here weakens mandatory human review: the
+    # message still lands in the intake queue for a person to confirm.
+    # Set WECOM_BOT_INGEST_INTERNAL=false to restore the strict filter.
+    bot_ingest_internal: bool = True
+
     # --- Session archive ------------------------------------------------------
     # The 会话内容存档 (Session Archive) secret, from 管理工具 → 聊天内容存档.
     # This is DISTINCT from WECOM_SECRET (the self-built app secret used for

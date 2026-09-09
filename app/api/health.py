@@ -68,4 +68,5 @@ def _bot_status() -> dict:
         "encoding_aes_key_length": len(aes_key),
         "encoding_aes_key_valid_length": len(aes_key) == 43,
         "replies_enabled": bool(settings.bot_reply_enabled),
+        "ingest_internal": bool(settings.bot_ingest_internal),
     }

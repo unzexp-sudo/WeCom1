@@ -19,6 +19,7 @@ import pytest
 from app.core import callback_crypto as cc
 from app.core.config import settings
 from app.models.wecom import WeComMessageLog
+from app.services.ingestor import ingest_entry
 
 
 # 32 bytes → base64 → strip trailing '=' → 43 chars, exactly the length WeCom
@@ -418,3 +419,62 @@ def test_bot_callback_does_not_shadow_app_callback(client, monkeypatch):
         },
     )
     assert res.status_code == 200
+
+# ---------------------------------------------------------------------------
+# Internal-sender filter vs. deliberate @-mentions
+# ---------------------------------------------------------------------------
+#
+# The internal-sender filter exists to keep AMBIENT staff chatter out of the
+# order queue. A smart bot never sees ambient chatter — WeCom only delivers
+# messages where the bot is @-mentioned — so dropping bot messages as
+# "internal" would mean our own staff could never test the bot, and the bot
+# would answer with silence.
+
+BOT_GROUP = "grp-bot-internal"
+
+
+def _bot_entry(msgid: str, *, chat: str | None = BOT_GROUP) -> dict:
+    entry = {
+        "msgid": msgid,
+        "msgtype": "text",
+        "from": "staffUser1",
+        "text": {"content": "下两箱土豆"},
+        "msgtime": 1_700_000_000_000,
+        "_bot": {"aibotid": "aib-1", "chatid": chat, "chattype": "group"},
+    }
+    if chat:
+        entry["roomid"] = chat
+    return entry
+
+
+def test_bot_mention_from_staff_is_still_ingested(db, mock_erp, monkeypatch):
+    """The whole point of the bot: our own staff must be able to test it."""
+    monkeypatch.setattr(settings, "internal_ops_chat_id", BOT_GROUP)
+
+    result = ingest_entry(db, _bot_entry("BOT-STAFF-1"))
+    assert result.status in ("received", "handed_off")
+
+
+def test_ambient_staff_chatter_in_the_same_group_is_still_ignored(db, mock_erp, monkeypatch):
+    """The safety rule is unchanged for everything that is NOT an @-mention."""
+    monkeypatch.setattr(settings, "internal_ops_chat_id", BOT_GROUP)
+
+    entry = _bot_entry("ARCHIVE-STAFF-1")
+    entry.pop("_bot")  # archive traffic has no bot sidecar
+    assert ingest_entry(db, entry).status == "ignored"
+
+
+def test_bot_mention_can_opt_back_into_the_strict_filter(db, mock_erp, monkeypatch):
+    monkeypatch.setattr(settings, "internal_ops_chat_id", BOT_GROUP)
+    monkeypatch.setattr(settings, "bot_ingest_internal", False)
+
+    assert ingest_entry(db, _bot_entry("BOT-STAFF-2")).status == "ignored"
+
+
+def test_staff_list_still_blocks_ambient_archive_traffic(db, mock_erp, monkeypatch):
+    """Same rule via the staff-list route (not just the ops chat id)."""
+    monkeypatch.setattr(settings, "staff_userids", "staffUser1")
+    entry = _bot_entry("ARCHIVE-STAFF-2")
+    entry.pop("_bot")
+    assert ingest_entry(db, entry).status == "ignored"
+    assert ingest_entry(db, _bot_entry("BOT-STAFF-3")).status in ("received", "handed_off")
