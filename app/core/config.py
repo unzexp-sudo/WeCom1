@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     bot_token: str = ""
     bot_encoding_aes_key: str = ""
 
+    # --- Smart-bot inline replies --------------------------------------------
+    # Each smart-bot callback carries a one-shot `response_url` the gateway can
+    # POST to in order to answer that message in place. Toggle with
+    # WECOM_BOT_REPLY_ENABLED; leave the text empty to use the bilingual
+    # default in app/services/bot_reply.py.
+    bot_reply_enabled: bool = True
+    bot_reply_text: str = ""
+
     # --- Session archive ------------------------------------------------------
     # The 会话内容存档 (Session Archive) secret, from 管理工具 → 聊天内容存档.
     # This is DISTINCT from WECOM_SECRET (the self-built app secret used for

@@ -26,7 +26,7 @@ import logging
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 
@@ -34,6 +34,7 @@ from app.api.callback import _encrypt_from_body, _ingest
 from app.core.callback_crypto import CallbackCryptoError, decrypt_with, verify_signature
 from app.core.config import settings
 from app.core.database import get_db
+from app.services.bot_reply import safe_reply_task
 
 logger = logging.getLogger("wecom.api.bot_callback")
 
@@ -196,6 +197,7 @@ def verify_bot_url(
 @router.post("/callback")
 async def on_bot_message(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> Any:
     """Receive a smart-bot message and hand it to the ingestor.
@@ -259,4 +261,14 @@ async def on_bot_message(
         entry.get("msgtype"),
     )
 
-    return _ingest(db, entry)
+    result = _ingest(db, entry)
+
+    # Ack back into the chat, but only after the response is already on the
+    # wire: WeCom allows the callback 5 seconds, and a slow or failing ack must
+    # never cost us the message itself.
+    if settings.bot_reply_enabled:
+        response_url = entry.get("_bot", {}).get("response_url")
+        if response_url:
+            background_tasks.add_task(safe_reply_task, response_url, result)
+
+    return result
