@@ -41,5 +41,31 @@ def health(db: Session = Depends(get_db)) -> dict:
         "archive_enabled": bool(settings.archive_private_key_path or settings.archive_sdk_path),
         "contacts": contacts,
         "messages": messages,
+        "bot_ready": _bot_ready(),
+        "bot": _bot_status(),
         "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _bot_ready() -> bool:
+    """True when both smart-bot credentials are present (never exposes values)."""
+    return bool(settings.bot_token and settings.bot_encoding_aes_key)
+
+
+def _bot_status() -> dict:
+    """Presence-only view of the smart-bot config — safe to expose publicly.
+
+    Secrets are never returned, only whether they are set and the key length,
+    which is what makes a WeCom console URL-verification handshake fail
+    (EncodingAESKey must be exactly 43 chars, Token at most 32).
+    """
+    token = settings.bot_token or ""
+    aes_key = settings.bot_encoding_aes_key or ""
+    return {
+        "token_configured": bool(token),
+        "token_length": len(token),
+        "encoding_aes_key_configured": bool(aes_key),
+        "encoding_aes_key_length": len(aes_key),
+        "encoding_aes_key_valid_length": len(aes_key) == 43,
+        "replies_enabled": bool(settings.bot_reply_enabled),
     }

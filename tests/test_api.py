@@ -28,6 +28,46 @@ def test_health_reports_mock_mode(client):
     assert "status" in body
 
 
+def test_health_reports_bot_credentials_as_presence_only(client):
+    """Railway env vars are invisible from the console — /wecom/health is the
+    only way to confirm WECOM_BOT_TOKEN / WECOM_BOT_ENCODING_AES_KEY landed."""
+    body = client.get("/wecom/health").json()
+
+    assert body["bot_ready"] is False
+    assert body["bot"]["token_configured"] is False
+    assert body["bot"]["encoding_aes_key_configured"] is False
+    # never leak the values, only whether they exist
+    assert "bot_token" not in body["bot"]
+    assert "bot_encoding_aes_key" not in body["bot"]
+
+
+def test_health_bot_ready_only_when_both_credentials_set(client, monkeypatch):
+    monkeypatch.setattr(settings, "bot_token", "T1BotToken_8af23")
+    assert client.get("/wecom/health").json()["bot_ready"] is False
+
+    monkeypatch.setattr(settings, "bot_encoding_aes_key", "x" * 43)
+    body = client.get("/wecom/health").json()
+    assert body["bot_ready"] is True
+    assert body["bot"]["token_length"] == 16
+    assert body["bot"]["encoding_aes_key_length"] == 43
+    assert body["bot"]["encoding_aes_key_valid_length"] is True
+
+
+def test_health_flags_a_wrong_length_encoding_aes_key(client, monkeypatch):
+    """A 42-char key is the classic copy-paste error that breaks URL verification."""
+    monkeypatch.setattr(settings, "bot_token", "T1BotToken_8af23")
+    monkeypatch.setattr(settings, "bot_encoding_aes_key", "y" * 42)
+
+    body = client.get("/wecom/health").json()
+    assert body["bot_ready"] is True  # present, so decrypt is attempted
+    assert body["bot"]["encoding_aes_key_valid_length"] is False
+
+
+def test_health_reports_bot_reply_switch(client, monkeypatch):
+    monkeypatch.setattr(settings, "bot_reply_enabled", False)
+    assert client.get("/wecom/health").json()["bot"]["replies_enabled"] is False
+
+
 def test_messages_list_uses_the_pagination_contract(client, db):
     db.add(WeComMessageLog(msgid="wm1", msgtype="text", status="received"))
     db.commit()
