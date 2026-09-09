@@ -185,7 +185,16 @@ def verify_url(
     nonce: str = Query(default=""),
     echostr: str = Query(default=""),
 ) -> PlainTextResponse:
-    if settings.is_mock:
+    # When WECOM_TOKEN + WECOM_ENCODING_AES_KEY are configured, WeCom's
+    # verification request carries a real Token-based signature and an
+    # AES-encrypted echostr. We must verify + decrypt, even in mock mode,
+    # because echoing the ciphertext raw makes WeCom's plaintext comparison
+    # fail. The legacy pure-mock shortcut (echo echostr straight back) is
+    # only safe when no creds are configured — i.e. the console has no
+    # Token/AESKey either, and the test suite still drives the endpoint
+    # the easy way.
+    has_creds = bool(settings.token) and bool(settings.encoding_aes_key)
+    if settings.is_mock and not has_creds:
         return PlainTextResponse(echostr or "")
 
     try:
