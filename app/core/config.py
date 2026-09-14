@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # --- Database -------------------------------------------------------------
     database_url: str = f"sqlite:///{GATEWAY_DIR / 'data' / 'wecom.db'}"
 
+    # Durability escape hatch. The container filesystem is ephemeral, so the
+    # default SQLite file is destroyed on every redeploy — taking the contact
+    # bindings, the message log and the dedupe record with it. In production we
+    # refuse to start on SQLite unless this is explicitly acknowledged.
+    allow_ephemeral_database: bool = False
+
     # --- WeCom app credentials (placeholders; filled in later via env) --------
     corp_id: str = ""
     agent_id: str = ""
