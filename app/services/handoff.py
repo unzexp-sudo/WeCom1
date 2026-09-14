@@ -9,7 +9,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from app.models.wecom import WeComMessageLog
+from app.models.wecom import WeComContact, WeComMessageLog
 
 logger = logging.getLogger("wecom.handoff")
 
@@ -42,6 +42,42 @@ def build_payload(msg: WeComMessageLog) -> dict:
     }
 
 
+def contact_display_fields(db, msg: WeComMessageLog) -> dict[str, Any]:
+    """Names for the ERP bind screen — never used to resolve a customer.
+
+    When a chat has never been bound, the ERP has to ask a human "who is this?"
+    It cannot answer that itself: `wecom_contacts` lives here, and an
+    `external_userid` is opaque to a person. Without these fields the bind queue
+    would show a wall of unreadable ids and the human would be guessing, which
+    is the exact failure this whole flow exists to prevent.
+
+    Display names are user-editable, so they are evidence for a human to read
+    and nothing more — the ERP stores them but never resolves on them.
+    """
+    if db is None or not msg.external_userid:
+        return {}
+    try:
+        contact = (
+            db.query(WeComContact)
+            .filter(WeComContact.external_userid == msg.external_userid)
+            .first()
+        )
+    except Exception as exc:  # noqa: BLE001 - enrichment must never break handoff
+        logger.warning("contact lookup failed for %s: %s", msg.external_userid, exc)
+        return {}
+    if contact is None:
+        return {}
+
+    # All three keys are always present once we have a contact row, even when a
+    # value is None: a stable wire shape is easier to reason about than one that
+    # gains and loses keys depending on what WeCom happened to fill in.
+    return {
+        "contact_name": contact.name,
+        "contact_alias": contact.alias,
+        "corp_name": contact.corp_name,
+    }
+
+
 def handoff(
     db,
     msg: WeComMessageLog,
@@ -56,6 +92,7 @@ def handoff(
         erp = get_erp_client()
 
     payload = build_payload(msg)
+    payload.update(contact_display_fields(db, msg))
     is_reply = bool(as_reply or msg.reply_to_msgid)
 
     try:

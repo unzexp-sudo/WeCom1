@@ -32,6 +32,14 @@ HANDOFF_KEYS = {
     "source_type",
     "received_at",
     "reply_to_msgid",
+    # Display-only identity hints for the ERP bind queue (§6, 2026-09-14).
+    # The ERP cannot resolve a conversation to a customer on its own — it has no
+    # access to `wecom_contacts` and an `external_userid` is unreadable to a
+    # human — so these travel with the handoff as evidence for the person who
+    # does the binding. They never resolve anything by themselves.
+    "contact_name",
+    "contact_alias",
+    "corp_name",
 }
 
 

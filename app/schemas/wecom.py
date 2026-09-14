@@ -42,6 +42,17 @@ class HandoffPayload(BaseModel):
     received_at: str | None = None
     reply_to_msgid: str | None = None
 
+    # Display-only identity hints for the ERP bind screen. The ERP cannot look
+    # these up — `wecom_contacts` lives here and an `external_userid` is opaque
+    # to a human — so without them the bind queue would ask someone to identify
+    # a conversation from an unreadable id, which is exactly the guess this flow
+    # exists to prevent. They are user-editable and MUST NOT be used to resolve
+    # a customer; the ERP stores them as evidence and resolves only on a
+    # human-confirmed binding.
+    contact_name: str | None = None
+    contact_alias: str | None = None
+    corp_name: str | None = None
+
 
 class HandoffResponse(BaseModel):
     document_id: str | None = None

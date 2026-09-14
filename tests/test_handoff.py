@@ -8,7 +8,7 @@ handoff = pytest.importorskip(
     reason="app.services.handoff is owned by agent A and is not implemented yet",
 )
 
-from app.models import WeComMessageLog  # noqa: E402
+from app.models import WeComContact, WeComMessageLog  # noqa: E402
 from app.schemas.wecom import HandoffPayload  # noqa: E402
 
 
@@ -29,16 +29,58 @@ def make_msg(db, **kwargs) -> WeComMessageLog:
 
 
 def test_build_payload_matches_contract_section_6(db):
-    payload = handoff.build_payload(
-        make_msg(db, customer_id="cust-1", received_at=None, chat_id="wr1")
+    msg = make_msg(db, customer_id="cust-1", received_at=None, chat_id="wr1")
+    db.add(
+        WeComContact(
+            external_userid="wmExtCanteen001",
+            name="陈师傅",
+            alias="佛山市政府饭堂",
+            corp_name="佛山市政府",
+        )
     )
-    assert set(payload) == set(HandoffPayload.model_fields)
+    db.commit()
+    payload = handoff.build_payload(msg)
+    # `build_payload` is the message itself. `handoff()` additionally attaches
+    # the display-only identity hints from `wecom_contacts`, so the two
+    # together — and only together — must cover the §6 schema exactly.
+    display = handoff.contact_display_fields(db, msg)
+    assert set(payload) | set(display) == set(HandoffPayload.model_fields)
+    assert set(payload) & set(display) == set()
     assert payload["msgid"] == "wm1"
     assert payload["customer_id"] == "cust-1"
     assert payload["content"] == "土豆 20斤"
     assert payload["source_type"] == "text"
     assert payload["reply_to_msgid"] is None
-    HandoffPayload(**payload)  # must validate
+    HandoffPayload(**payload, **display)  # must validate
+
+
+def test_contact_display_fields_are_evidence_only(db):
+    """The hints are read from `wecom_contacts` and are best-effort.
+
+    A missing contact, a missing external_userid or a lookup failure must all
+    degrade to "no hints" — enrichment is never allowed to break a handoff.
+    """
+    msg = make_msg(db, customer_id="cust-1")
+    assert handoff.contact_display_fields(db, msg) == {}
+
+    db.add(
+        WeComContact(
+            external_userid="wmExtCanteen001",
+            name="陈师傅",
+            alias="佛山市政府饭堂",
+            corp_name="佛山市政府",
+        )
+    )
+    db.commit()
+
+    fields = handoff.contact_display_fields(db, msg)
+    assert fields == {
+        "contact_name": "陈师傅",
+        "contact_alias": "佛山市政府饭堂",
+        "corp_name": "佛山市政府",
+    }
+    # Blank fields are dropped rather than sent as empty strings.
+    assert all(v for v in fields.values())
 
 
 def test_build_payload_carries_media_fields(db):
