@@ -5,6 +5,7 @@
 | `GET  /wecom/callback`          | URL verification (echo the decrypted `echostr`) |
 | `POST /wecom/callback`          | app message callback → ingestor |
 | `POST /wecom/archive/callback`  | `msgaudit_notify` ping → immediate archive pull |
+| `POST /wecom/archive/pull`      | run one pull synchronously, return the counters |
 | `POST /wecom/ingest`            | simulator injection point (already-decrypted entry) |
 
 In mock mode signature verification and decryption are skipped and the body is
@@ -24,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.core.callback_crypto import CallbackCryptoError, decrypt, verify_signature
 from app.core.config import settings
 from app.core.database import SessionLocal, get_db
+from app.core.security import require_service_key
 
 logger = logging.getLogger("wecom.api.callback")
 
@@ -357,3 +359,28 @@ async def archive_callback(
 
     background_tasks.add_task(_safe_pull_once)
     return {"errcode": 0, "errmsg": "ok"}
+
+
+@router.post("/archive/pull", dependencies=[Depends(require_service_key)])
+def archive_pull_now(db: Session = Depends(get_db)) -> dict:
+    """Run one archive pull **synchronously** and return the summary.
+
+    `POST /wecom/archive/callback` is the production path, but it answers
+    `{"errcode":0}` before the pull has run, so it cannot tell you whether the
+    pull actually worked — which is exactly the question during go-live. This
+    endpoint runs the same `pull_once` inline and hands back its counters, so a
+    credential, key or trusted-IP problem shows up as a number instead of a
+    silent nothing.
+
+    Read-only against WeCom (a pull, never a send) and guarded by
+    `X-Gateway-Key` so it is not a public way to hammer the archive API.
+    """
+    from app.services.archive import pull_once
+
+    try:
+        summary = pull_once(db)
+    except Exception as exc:  # noqa: BLE001 - report, never 500
+        logger.exception("Manual archive pull failed")
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": True, **summary}

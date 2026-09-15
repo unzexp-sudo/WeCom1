@@ -147,13 +147,72 @@ def main() -> int:
         print(f"\n{INFO}Until this passes, every live send fails. Stay in mock mode.")
         blocking += 1
 
-    # --- 4. verdict ------------------------------------------------------
+    # --- 4. session archive ----------------------------------------------
+    # The archive is the ONLY inbound path for real customer orders (the smart
+    # bot is internal-groups-only), so this check matters more than the send
+    # checks above. It is read-only: `get_chat_data` pulls, it never sends.
+    print("\nSession Archive  (POST /cgi-bin/msgaudit/get_chat_data)")
+    print("-" * 60)
+    archive_secret = (settings.archive_secret or "").strip()
+    if not archive_secret:
+        print(f"{NO}WECOM_ARCHIVE_SECRET is not set — the archive cannot be pulled.")
+        print(f"{INFO}It is NOT WECOM_SECRET. Get it from:")
+        print(f"{INFO}  Admin Console -> Security & Management -> Management Tools")
+        print(f"{INFO}  -> Conversation Content Archiving")
+        blocking += 1
+    else:
+        print(f"{INFO}archive_secret       = {mask(archive_secret)}")
+        try:
+            resp = client.get(
+                f"{BASE}/gettoken",
+                params={"corpid": settings.corp_id, "corpsecret": archive_secret},
+            )
+            adata = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{NO}archive token request failed: {exc}")
+            adata = {}
+
+        if adata.get("errcode"):
+            print(f"{NO}archive gettoken errcode={adata.get('errcode')} "
+                  f"errmsg={adata.get('errmsg')}")
+            print(f"{INFO}The archive secret is wrong, or the feature is not activated.")
+            blocking += 1
+        else:
+            print(f"{OK}archive token issued")
+            atoken = adata["access_token"]
+            # limit=1 keeps the probe cheap. This is a READ; nothing is sent.
+            resp = client.post(
+                f"{BASE}/msgaudit/get_chat_data",
+                params={"access_token": atoken},
+                json={"seq": 0, "limit": 1, "timeout": settings.archive_timeout},
+            )
+            gdata = resp.json()
+            gerr = gdata.get("errcode")
+            if gerr == 0:
+                n = len(gdata.get("chatdata", []) or [])
+                print(f"{OK}get_chat_data reachable (returned {n} entr{'y' if n == 1 else 'ies'})")
+                print(f"{INFO}The archive is pullable from this IP. Inbound is live-capable.")
+            else:
+                errmsg = gdata.get("errmsg", "")
+                ip_match = IP_RE.search(errmsg)
+                print(f"{NO}get_chat_data errcode={gerr} errmsg={errmsg}")
+                if gerr == 60020 and ip_match:
+                    print(f"\n{INFO}This IP is not allow-listed: {ip_match.group(1)}")
+                    print(f"{INFO}Add it under Admin Console -> My Enterprise -> 可信IP.")
+                    print(f"{INFO}On Railway the egress IP is DYNAMIC — it will change on")
+                    print(f"{INFO}redeploy, so a fixed-IP host or proxy is the real fix.")
+                elif gerr == 60011:
+                    print(f"{INFO}No privilege — the archive is not enabled for this corp.")
+                blocking += 1
+
+    # --- 5. verdict ------------------------------------------------------
     print("\n" + "=" * 60)
     missing = [
         name
         for name, value in (
             ("WECOM_TOKEN", settings.token),
             ("WECOM_ENCODING_AES_KEY", settings.encoding_aes_key),
+            ("WECOM_ARCHIVE_SECRET", settings.archive_secret),
             ("WECOM_ARCHIVE_PRIVATE_KEY_PATH", settings.archive_private_key_path),
         )
         if not value

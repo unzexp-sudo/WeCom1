@@ -78,10 +78,22 @@ class Settings(BaseSettings):
     # The 会话内容存档 (Session Archive) secret, from 管理工具 → 聊天内容存档.
     # This is DISTINCT from WECOM_SECRET (the self-built app secret used for
     # outbound send). Both the `msgaudit/get_chat_data` access token and the
-    # finance SDK `Init()` require THIS secret, not the app secret. Empty →
-    # fall back to WECOM_SECRET so single-secret setups still boot.
+    # finance SDK `Init()` require THIS secret, not the app secret.
+    #
+    # NOTE: an earlier version of this comment claimed an empty value "falls
+    # back to WECOM_SECRET so single-secret setups still boot". That fallback
+    # was never implemented, and implementing it would be wrong anyway — the
+    # app secret is not accepted for msgaudit. Leave this EMPTY only if you do
+    # not intend to use the archive; otherwise set it, or every archive pull
+    # fails with "WECOM_CORP_ID / WECOM_ARCHIVE_SECRET are not configured".
     archive_secret: str = ""
     archive_private_key_path: str = ""
+    # Container platforms hand us env vars, not files, and `PureCryptoDecryptor`
+    # reads a PATH. This carries the PEM as base64 so the gateway can materialise
+    # it to a 0600 file at boot (see `archive.materialize_private_key`). Prefer
+    # `archive_private_key_path` on a host where you can place the file directly;
+    # this exists so a Railway/Heroku-style deploy has *some* way to work.
+    archive_private_key_b64: str = ""
     archive_sdk_path: str = ""
     # "pure" = pure-Python RSA/AES via `cryptography`; "sdk" = official C SDK
     decrypt_provider: str = "pure"

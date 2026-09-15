@@ -2,10 +2,23 @@
 
 Same AES/sha1 scheme as the self-built-app callback, but with separate
 credentials (bot_token / bot_encoding_aes_key) and a lower-case JSON envelope
-(msgid, aibotid, chatid, chattype, from.userid, text.content, …). The bot can
-be added to internal groups and (with Session Archive enabled) to external
-"客户群"; messages are delivered when a user @-mentions the bot in a group,
-or messages the bot directly in 1:1.
+(msgid, aibotid, chatid, chattype, from.userid, text.content, …). Messages are
+delivered when a user @-mentions the bot in a group, or messages it in 1:1.
+
+**INTERNAL GROUPS ONLY.** Per the WeCom help centre ("How to Use Smart Robot",
+open.work.weixin.qq.com/help2/pc/21663, §IV.1 and FAQ Q7): *"Robots can only be
+added to internal enterprise groups… Currently, adding robots to Interconnected
+Groups, Upstream/Downstream Groups, or External Groups is not supported."* An
+earlier version of this docstring claimed the bot could reach external 客户群
+with Session Archive enabled. That is wrong and cost real debugging time: the
+client's group ⋯ menu offers no Smart Robot entry at all, only "Message Push".
+
+Worse, the same page states that **chat records between members and a Smart
+Robot cannot be captured by Conversation Content Archiving**. The bot and the
+archive are therefore not two routes to the same place — the archive will never
+see a bot conversation. Real customer orders have exactly one inbound path, the
+Session Archive (`app/services/archive.py`); the bot is a *testing* surface for
+internal groups only.
 
 | endpoint | purpose |
 |---|---|

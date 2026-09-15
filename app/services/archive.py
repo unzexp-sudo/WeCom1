@@ -5,11 +5,13 @@ advances the cursor. Never raises out — one bad entry must not stop the batch.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import threading
 from typing import Any
 
-from app.core.config import settings
+from app.core.config import REPO_ROOT, settings
 from app.core.database import SessionLocal
 from app.models.base import utcnow
 from app.models.wecom import WeComMessageCursor
@@ -17,6 +19,61 @@ from app.models.wecom import WeComMessageCursor
 logger = logging.getLogger("wecom.archive")
 
 DEFAULT_CURSOR_KEY = "archive"
+
+
+def materialize_private_key() -> str | None:
+    """Write the archive RSA key to disk when it arrived as base64 in the env.
+
+    `PureCryptoDecryptor` takes a *path*, but a container platform only offers
+    env vars — and the README is explicit that key material must never sit in
+    one. This bridges the two: decode once per boot into a 0600 file under
+    `data/` (gitignored) and point `archive_private_key_path` at it. The file is
+    rebuilt on every boot, so it survives nothing and leaks nothing.
+
+    Returns the path written, or None when there is nothing to do. Never raises:
+    a bad value must degrade to "archive not configured", not to a dead gateway.
+    """
+    raw_b64 = (settings.archive_private_key_b64 or "").strip()
+    if not raw_b64:
+        return None
+
+    try:
+        pem = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        logger.error(
+            "WECOM_ARCHIVE_PRIVATE_KEY_B64 is not valid base64 (%s) — the archive "
+            "will stay disabled. Did you paste the PEM itself instead of its "
+            "base64 encoding?",
+            exc,
+        )
+        return None
+
+    if b"PRIVATE KEY" not in pem:
+        logger.error(
+            "WECOM_ARCHIVE_PRIVATE_KEY_B64 decoded to %s bytes but contains no "
+            "'PRIVATE KEY' PEM header — the archive will stay disabled.",
+            len(pem),
+        )
+        return None
+
+    target = REPO_ROOT / "data" / "archive_private_key.pem"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(pem)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            # Some container filesystems refuse chmod. Not worth failing over.
+            logger.warning("Could not chmod 0600 on %s — continuing", target)
+    except OSError as exc:
+        logger.error("Could not write the archive private key to %s: %s", target, exc)
+        return None
+
+    settings.archive_private_key_path = str(target)
+    logger.info(
+        "Archive private key materialised at %s (%s bytes)", target, len(pem)
+    )
+    return str(target)
 
 
 def get_cursor(db, key: str = DEFAULT_CURSOR_KEY) -> WeComMessageCursor:

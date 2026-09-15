@@ -52,6 +52,42 @@ async def lifespan(_: FastAPI):
     except Exception:  # noqa: BLE001
         logger.exception("startup: init_db FAILED — gateway will start but DB-backed endpoints may 500 until the database is reachable")
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # --- Session Archive -----------------------------------------------------
+    # Two things have to happen here or the customer-order path is dead:
+    #
+    # 1. The RSA key must be a FILE — `PureCryptoDecryptor` reads a path — but a
+    #    container platform only gives us env vars. `materialize_private_key`
+    #    bridges that by decoding WECOM_ARCHIVE_PRIVATE_KEY_B64 to a 0600 file.
+    # 2. The poller must actually run. It was written, tested and then never
+    #    called, so the gateway only ever pulled when WeCom sent an
+    #    `msgaudit_notify` ping to /wecom/archive/callback — and a quiet group
+    #    never sends one. Archive data expires after 5 days, so that is a real
+    #    way to lose orders.
+    #
+    # The pull is OUTBOUND (POST to qyapi.weixin.qq.com/cgi-bin/msgaudit/
+    # get_chat_data), which is why this path needs no public callback URL, no
+    # domain, and no WeCom domain-entity verification.
+    try:
+        from app.services.archive import materialize_private_key
+
+        materialize_private_key()
+    except Exception:  # noqa: BLE001 - a key problem must not kill the gateway
+        logger.exception("startup: archive private-key bootstrap failed")
+
+    if settings.archive_private_key_path or settings.archive_sdk_path:
+        try:
+            from app.services.archive import start_poller
+
+            start_poller()
+        except Exception:  # noqa: BLE001
+            logger.exception("startup: archive poller failed to start")
+    else:
+        logger.info(
+            "startup: archive poller NOT started — set WECOM_ARCHIVE_PRIVATE_KEY_PATH "
+            "(or WECOM_ARCHIVE_PRIVATE_KEY_B64) to enable Session Archive ingestion"
+        )
+
     yield
 
 
