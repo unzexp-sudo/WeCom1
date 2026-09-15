@@ -60,3 +60,29 @@ def test_start_poller_returns_a_daemon_thread():
         if isinstance(event, threading.Event):
             event.set()
             break
+
+
+def test_pull_once_reports_why_the_api_call_failed(db):
+    """A failed fetch used to return bare zeros, so "the archive API rejected
+    us" and "there is nothing new" produced byte-identical output. That is the
+    worst possible ambiguity during go-live, where the cause is nearly always a
+    wrong archive secret or an egress IP that is not in 可信IP yet."""
+
+    class _Boom:
+        def get_chat_data(self, **kwargs):
+            raise RuntimeError("errcode 60020 not allow to access from your ip")
+
+    summary = archive.pull_once(db, api=_Boom())
+
+    assert summary["fetched"] == 0
+    assert summary["error"] is not None
+    assert "60020" in summary["error"]
+
+
+def test_pull_once_reports_no_error_on_a_clean_pull(
+    db, mock_erp, mock_api, simulator_archive
+):
+    """The success path must carry error=None so a caller can branch on it
+    rather than on a truthiness accident."""
+    summary = archive.pull_once(db, api=mock_api, erp=mock_erp)
+    assert summary["error"] is None

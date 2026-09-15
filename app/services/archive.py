@@ -122,7 +122,18 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         )
     except Exception as exc:  # noqa: BLE001 - an unreachable archive is not fatal
         logger.warning("Archive pull from seq=%s failed: %s", start_seq, exc)
-        return {"fetched": 0, "ingested": 0, "skipped": 0, "last_seq": start_seq}
+        # Carry the reason out of here. Returning bare zeros made "the API call
+        # failed" indistinguishable from "the archive has no new messages" — and
+        # that is the exact question during go-live, where a wrong archive secret
+        # or a rejected 可信IP both looked like a successful, empty pull.
+        return {
+            "fetched": 0,
+            "ingested": 0,
+            "skipped": 0,
+            "failed": 0,
+            "last_seq": start_seq,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
     entries = [e for e in (entries or []) if isinstance(e, dict)]
     ingested = 0
@@ -199,6 +210,7 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         "skipped": skipped,
         "failed": failed,
         "last_seq": max_seq,
+        "error": None,
     }
 
 
