@@ -194,6 +194,19 @@ class Settings(BaseSettings):
         return {s.strip() for s in self.send_allowlist.split(",") if s.strip()}
 
     @property
+    def gateway_service_key_is_default(self) -> bool:
+        """True while the shared secret is still the published placeholder.
+
+        This key guards POST /wecom/send and POST /wecom/archive/pull. Its default
+        is committed to the repo and printed in .env.example, so a deployment that
+        never overrode it is "protected" by a value anyone who can read the repo
+        already knows. The comparison reads the field's own default rather than
+        repeating the literal, so it stays correct if the placeholder ever changes.
+        """
+        default = type(self).model_fields["gateway_service_key"].default
+        return (self.gateway_service_key or "").strip() == (default or "").strip()
+
+    @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 

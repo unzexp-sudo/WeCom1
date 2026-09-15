@@ -432,3 +432,39 @@ def test_archive_callback_triggers_a_pull(client, mock_erp, simulator_archive):
 
 def test_media_endpoint_404_for_missing_file(client):
     assert client.get("/wecom/media/does-not-exist.png").status_code == 404
+
+
+def test_health_flags_the_published_default_gateway_key(client, monkeypatch):
+    """The default shared secret is committed to the repo and printed in
+    .env.example, so it is a placeholder rather than a secret — yet it guards
+    /wecom/send and /wecom/archive/pull. Health must say so out loud, because
+    a working-but-public key produces no other symptom."""
+    monkeypatch.setattr(settings, "gateway_service_key", "dev-gateway-key")
+
+    config = client.get("/wecom/health").json()["config"]
+    assert config["gateway_service_key_is_default"] is True
+    assert any("WECOM_GATEWAY_SERVICE_KEY" in w for w in config["warnings"])
+    # The warning has to name the other half of the pair, or the operator
+    # rotates one side and 401s every handoff.
+    assert any("ERP_WECOM_GATEWAY_KEY" in w for w in config["warnings"])
+
+
+def test_health_does_not_flag_a_rotated_gateway_key(client, monkeypatch):
+    """The check compares against the field's own default, so any real secret
+    clears it. Guards against the check silently firing forever on every
+    correctly-configured deployment."""
+    monkeypatch.setattr(settings, "gateway_service_key", "s3cret-rotated-value")
+
+    config = client.get("/wecom/health").json()["config"]
+    assert config["gateway_service_key_is_default"] is False
+    assert not any("WECOM_GATEWAY_SERVICE_KEY" in w for w in config["warnings"])
+
+
+def test_gateway_service_key_default_check_tracks_the_config_default():
+    """Binds the check to Settings itself: if the placeholder in config.py is
+    ever changed, the check must follow it without a second literal to update."""
+    from app.core.config import Settings
+
+    field_default = Settings.model_fields["gateway_service_key"].default
+    assert Settings(gateway_service_key=field_default).gateway_service_key_is_default
+    assert not Settings(gateway_service_key="other").gateway_service_key_is_default

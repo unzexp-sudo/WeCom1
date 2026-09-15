@@ -126,6 +126,14 @@ def _config_readiness() -> dict:
             "An archive private key is configured but WECOM_ARCHIVE_SECRET is "
             "empty — the msgaudit token cannot be fetched, so nothing will pull."
         )
+    if settings.gateway_service_key_is_default:
+        warnings.append(
+            "WECOM_GATEWAY_SERVICE_KEY is still the placeholder published in "
+            ".env.example. It guards POST /wecom/send and POST /wecom/archive/pull, "
+            "so treat it as public: set a long random value here AND set the same "
+            "value as ERP_WECOM_GATEWAY_KEY on the ERP service. They must match — "
+            "a mismatch 401s every handoff."
+        )
 
     return {
         "staff_userids_count": len(staff),
@@ -133,6 +141,7 @@ def _config_readiness() -> dict:
         "ingest_only_order_groups": bool(settings.ingest_only_order_groups),
         "internal_ops_chat_id_set": bool((settings.internal_ops_chat_id or "").strip()),
         "send_allowlist_count": len(allow),
+        "gateway_service_key_is_default": bool(settings.gateway_service_key_is_default),
         "media_url_base": media_base,
         "media_dir": settings.media_dir,
         "erp_base_url": settings.erp_base_url,
