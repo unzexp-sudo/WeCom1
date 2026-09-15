@@ -89,6 +89,24 @@ def _config_readiness() -> dict:
             "different container, so it cannot fetch attachments from this "
             "URL. Set it to the gateway's public URL."
         )
+    elif media_base:
+        # A loopback check is not enough. The live deploy was found pointing at
+        # the ERP's own host with no path, which looks like a real URL and is
+        # just as broken: the gateway is the service that serves /wecom/media,
+        # and `storage.save` appends "/{filename}" to whatever is here.
+        erp = (settings.erp_base_url or "").rstrip("/")
+        if erp and media_base.rstrip("/").startswith(erp):
+            warnings.append(
+                f"WECOM_MEDIA_URL_BASE is {media_base!r} — that is the ERP's "
+                "own host. Attachments are served by the GATEWAY at "
+                "/wecom/media, so the ERP will fetch itself and 404."
+            )
+        elif not media_base.rstrip("/").endswith("/wecom/media"):
+            warnings.append(
+                f"WECOM_MEDIA_URL_BASE is {media_base!r} and does not end in "
+                "/wecom/media. The gateway serves attachments at "
+                "/wecom/media/{filename}, so every file_url will 404."
+            )
     if key_path and not os.path.exists(key_path):
         warnings.append(
             f"WECOM_ARCHIVE_PRIVATE_KEY_PATH is set but {key_path} does not "
