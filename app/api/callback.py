@@ -384,3 +384,46 @@ def archive_pull_now(db: Session = Depends(get_db)) -> dict:
         return {"ok": False, "error": str(exc)}
 
     return {"ok": True, **summary}
+
+
+@router.get("/archive/egress-ip", dependencies=[Depends(require_service_key)])
+def archive_egress_ip() -> dict:
+    """Report the public IP this service actually egresses from.
+
+    The archive API only answers calls from an address whitelisted in the WeCom
+    console (可信IP); anything else returns `errcode=60020` / `10009`. That
+    whitelist is a static list, so the question "what IP am I calling from?" has
+    to be answerable at runtime — otherwise a rotated egress IP looks exactly
+    like "the archive has no messages".
+
+    This asks a public echo service **from the same process that does the
+    pulling**, which proves the real egress path rather than repeating what the
+    hosting dashboard says was assigned. On Railway with Static Outbound IPs
+    enabled, the answer should be one of the three assigned addresses; if it is
+    anything else, the whitelist is stale and every pull is about to fail.
+
+    Read-only, never cached, and guarded by `X-Gateway-Key`.
+    """
+    import httpx
+
+    providers = (
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://ifconfig.me/ip",
+    )
+    errors: list[str] = []
+    for url in providers:
+        try:
+            # trust_env=False matches the adapters: an ambient HTTP_PROXY must
+            # not silently change which IP WeCom sees.
+            with httpx.Client(trust_env=False, timeout=10.0) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                ip = response.text.strip()
+            if ip:
+                return {"ok": True, "egress_ip": ip, "source": url}
+            errors.append(f"{url}: empty response")
+        except Exception as exc:  # noqa: BLE001 - report, never 500
+            errors.append(f"{url}: {exc}")
+
+    return {"ok": False, "error": "; ".join(errors) or "no provider answered"}

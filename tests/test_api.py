@@ -96,6 +96,74 @@ def test_health_points_at_the_gate_switch_when_it_is_off(client, monkeypatch):
     assert not any("fails OPEN" in w for w in warnings)
 
 
+def test_archive_egress_ip_is_guarded_and_reports_the_ip(client, monkeypatch):
+    """The 可信IP whitelist is a static list, so "what IP am I calling from?"
+    has to be answerable at runtime — a rotated egress IP otherwise looks
+    identical to "the archive has no messages"."""
+    import httpx
+
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    assert client.get("/wecom/archive/egress-ip").status_code == 401
+
+    class _Response:
+        text = "203.0.113.9\n"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+    res = client.get(
+        "/wecom/archive/egress-ip", headers={"X-Gateway-Key": "test-key"}
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["egress_ip"] == "203.0.113.9"
+
+
+def test_archive_egress_ip_reports_failure_instead_of_raising(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+
+    class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            raise RuntimeError("no route to host")
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+    res = client.get(
+        "/wecom/archive/egress-ip", headers={"X-Gateway-Key": "test-key"}
+    )
+    assert res.status_code == 200  # never 500 — this is a diagnostic
+    body = res.json()
+    assert body["ok"] is False
+    assert "no route to host" in body["error"]
+
+
 def test_messages_list_uses_the_pagination_contract(client, db):
     db.add(WeComMessageLog(msgid="wm1", msgtype="text", status="received"))
     db.commit()
