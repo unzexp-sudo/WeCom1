@@ -43,7 +43,80 @@ def health(db: Session = Depends(get_db)) -> dict:
         "messages": messages,
         "bot_ready": _bot_ready(),
         "bot": _bot_status(),
+        "config": _config_readiness(),
         "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _config_readiness() -> dict:
+    """Presence-only view of the routing/archive config, plus derived warnings.
+
+    Why this exists: several settings fail *silently* when they are wrong, and
+    the failure only shows up as "the ERP is full of junk" or "attachments are
+    missing" days later. `WECOM_STAFF_USERIDS` empty means every internal
+    message is ingested as a customer order; `WECOM_MEDIA_URL_BASE` left at its
+    loopback default means the ERP can never fetch an attachment, because
+    127.0.0.1 inside the ERP container is the ERP itself.
+
+    Only presence, counts, lengths and non-secret URLs are returned — never a
+    secret value. `warnings` is the part worth reading.
+    """
+    import os
+
+    staff = settings.staff_list()
+    groups = settings.order_group_list()
+    allow = settings.send_allowlist_set()
+    media_base = (settings.media_url_base or "").strip()
+    key_path = (settings.archive_private_key_path or "").strip()
+
+    warnings: list[str] = []
+
+    if not staff:
+        warnings.append(
+            "WECOM_STAFF_USERIDS is empty — every internal message will be "
+            "ingested as a customer order. This is the single most damaging "
+            "omission once the archive is on."
+        )
+    if not groups:
+        warnings.append(
+            "WECOM_ORDER_GROUP_IDS is empty and nothing filters on "
+            "is_order_group — every conversation the archive returns will be "
+            "ingested, internal or not."
+        )
+    if "127.0.0.1" in media_base or "localhost" in media_base:
+        warnings.append(
+            f"WECOM_MEDIA_URL_BASE is {media_base!r} — the ERP runs in a "
+            "different container, so it cannot fetch attachments from this "
+            "URL. Set it to the gateway's public URL."
+        )
+    if key_path and not os.path.exists(key_path):
+        warnings.append(
+            f"WECOM_ARCHIVE_PRIVATE_KEY_PATH is set but {key_path} does not "
+            "exist on this filesystem — every archive message will fail to "
+            "decrypt."
+        )
+    if key_path and not (settings.archive_secret or "").strip():
+        warnings.append(
+            "An archive private key is configured but WECOM_ARCHIVE_SECRET is "
+            "empty — the msgaudit token cannot be fetched, so nothing will pull."
+        )
+
+    return {
+        "staff_userids_count": len(staff),
+        "order_group_ids_count": len(groups),
+        "internal_ops_chat_id_set": bool((settings.internal_ops_chat_id or "").strip()),
+        "send_allowlist_count": len(allow),
+        "media_url_base": media_base,
+        "media_dir": settings.media_dir,
+        "erp_base_url": settings.erp_base_url,
+        "archive_secret_set": bool((settings.archive_secret or "").strip()),
+        "archive_private_key_path": key_path,
+        "archive_private_key_b64_set": bool(
+            (settings.archive_private_key_b64 or "").strip()
+        ),
+        "decrypt_provider": settings.decrypt_provider,
+        "corp_id_set": bool((settings.corp_id or "").strip()),
+        "warnings": warnings,
     }
 
 
