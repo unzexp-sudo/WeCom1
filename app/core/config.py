@@ -103,6 +103,30 @@ class Settings(BaseSettings):
     order_group_ids: str = ""
     internal_ops_chat_id: str = ""
 
+    # --- Ingest scope ---------------------------------------------------------
+    # 会话内容存档 returns EVERY conversation in the corp — internal chats,
+    # 1:1s, groups that have nothing to do with orders. The only other inbound
+    # filter is `staff_userids`, which is a deny-list: it can only exclude
+    # people you remembered to list.
+    #
+    # When true, a message is ingested only if its `chat_id` is in
+    # `order_group_ids`. Everything else is recorded as `ignored` with a reason,
+    # so nothing vanishes silently.
+    #
+    # DEFAULT FALSE — existing behaviour, and the existing tests, are untouched.
+    #
+    # Deliberate failure mode: if this is true but `order_group_ids` is EMPTY,
+    # the gate does NOT engage (it ingests everything) and `/wecom/health`
+    # reports a warning. A noisy queue is recoverable; an order dropped by a
+    # misconfiguration is not. Failing open is the only defensible direction
+    # for order intake.
+    #
+    # Trade-off to be aware of: this is group-only. A customer who orders in a
+    # 1:1 chat has no `chat_id` and would be ignored. Your model is that orders
+    # arrive in group chats (see docs/WECOM_CONTRACTS.md), so this matches it —
+    # but it is a real behaviour change, which is why it is opt-in.
+    ingest_only_order_groups: bool = False
+
     # --- Blast-radius control -------------------------------------------------
     # Comma-separated external_userids / chat_ids. When non-empty, a *live* send
     # to anything not on this list is refused and logged as `blocked` instead of

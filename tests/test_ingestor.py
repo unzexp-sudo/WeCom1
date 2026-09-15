@@ -192,3 +192,74 @@ def test_handoff_failure_keeps_the_message(db, mock_api, storage):
     row = db.query(WeComMessageLog).filter_by(msgid=prod.TEXT_MSGID).one()
     assert row.status == "failed"
     assert row.error
+
+
+# ---------------------------------------------------------------------------
+# ingest scope gate — WECOM_INGEST_ONLY_ORDER_GROUPS (§4.4a)
+#
+# The archive is a firehose: it returns every conversation in the corp. These
+# cover the opt-in allow-list, including the deliberate fail-open.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_gate_is_off_by_default(db, mock_erp, mock_api, storage):
+    """Opt-in means opt-in: an untouched deploy behaves exactly as before."""
+    assert ingestor.settings.ingest_only_order_groups is False
+    result = ingestor.ingest_entry(db, text_entry(), erp=mock_erp, api=mock_api, storage=storage)
+    assert result.status == "handed_off"
+
+
+def test_scope_gate_still_ingests_a_listed_order_group(db, mock_erp, mock_api, storage, monkeypatch):
+    """Turning the gate on must not break the path it exists to protect."""
+    monkeypatch.setattr(ingestor.settings, "ingest_only_order_groups", True)
+    entry = prod.SCENARIOS["group_order"](20)[0]
+    # conftest pins WECOM_ORDER_GROUP_IDS to exactly this room
+    assert entry["roomid"] == prod.ORDER_GROUP_CHAT_ID
+    result = ingestor.ingest_entry(db, entry, erp=mock_erp, api=mock_api, storage=storage)
+    assert result.status == "handed_off"
+
+
+def test_scope_gate_ignores_a_conversation_outside_the_order_groups(
+    db, mock_erp, mock_api, storage, monkeypatch
+):
+    monkeypatch.setattr(ingestor.settings, "ingest_only_order_groups", True)
+    entry = prod.SCENARIOS["group_order"](21)[0]
+    entry["roomid"] = "wrSomeUnrelatedGroup"
+
+    result = ingestor.ingest_entry(db, entry, erp=mock_erp, api=mock_api, storage=storage)
+
+    assert result.status == "ignored"
+    assert mock_erp.calls == []  # not even a find_customer lookup
+    # The gate sits ABOVE identity resolution, so the unrelated room must not
+    # have been recorded as a group either.
+    assert db.query(WeComGroup).filter_by(chat_id="wrSomeUnrelatedGroup").count() == 0
+    assert db.query(WeComMessageLog).filter_by(msgid=result.msgid).one().status == "ignored"
+
+
+def test_scope_gate_ignores_a_1to1_and_writes_no_contact(
+    db, mock_erp, mock_api, storage, monkeypatch
+):
+    """A 1:1 has no chat_id, so with the gate on it can never match the
+    allow-list. The contact assertion is the real point: a dropped message
+    must not have written a contact row on its way out."""
+    monkeypatch.setattr(ingestor.settings, "ingest_only_order_groups", True)
+
+    result = ingestor.ingest_entry(db, text_entry(), erp=mock_erp, api=mock_api, storage=storage)
+
+    assert result.status == "ignored"
+    assert mock_erp.calls == []
+    assert db.query(WeComContact).count() == 0
+    assert db.query(WeComMessageLog).filter_by(msgid=prod.TEXT_MSGID).one().status == "ignored"
+
+
+def test_scope_gate_fails_open_on_an_empty_allow_list(
+    db, mock_erp, mock_api, storage, monkeypatch
+):
+    """Switching the gate on without naming a group must NOT drop every order.
+    A noisy queue is recoverable; a silently dropped order is not."""
+    monkeypatch.setattr(ingestor.settings, "ingest_only_order_groups", True)
+    monkeypatch.setattr(ingestor.settings, "order_group_ids", "")
+
+    result = ingestor.ingest_entry(db, text_entry(), erp=mock_erp, api=mock_api, storage=storage)
+
+    assert result.status == "handed_off"

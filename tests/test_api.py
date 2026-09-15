@@ -68,6 +68,34 @@ def test_health_reports_bot_reply_switch(client, monkeypatch):
     assert client.get("/wecom/health").json()["bot"]["replies_enabled"] is False
 
 
+def test_health_reports_the_ingest_scope_gate(client, monkeypatch):
+    assert client.get("/wecom/health").json()["config"]["ingest_only_order_groups"] is False
+
+    monkeypatch.setattr(settings, "ingest_only_order_groups", True)
+    assert client.get("/wecom/health").json()["config"]["ingest_only_order_groups"] is True
+
+
+def test_health_warns_when_the_scope_gate_is_on_but_no_groups_are_named(client, monkeypatch):
+    """The gate fails open by design — the warning is the only signal that the
+    operator switched it on and got nothing."""
+    monkeypatch.setattr(settings, "ingest_only_order_groups", True)
+    monkeypatch.setattr(settings, "order_group_ids", "")
+
+    warnings = client.get("/wecom/health").json()["config"]["warnings"]
+    assert any("fails OPEN" in w for w in warnings)
+
+
+def test_health_points_at_the_gate_switch_when_it_is_off(client, monkeypatch):
+    """The old wording asserted 'nothing filters on is_order_group'. Now that a
+    gate exists, the warning must name the switch instead of denying it."""
+    monkeypatch.setattr(settings, "ingest_only_order_groups", False)
+    monkeypatch.setattr(settings, "order_group_ids", "")
+
+    warnings = client.get("/wecom/health").json()["config"]["warnings"]
+    assert any("WECOM_INGEST_ONLY_ORDER_GROUPS is off" in w for w in warnings)
+    assert not any("fails OPEN" in w for w in warnings)
+
+
 def test_messages_list_uses_the_pagination_contract(client, db):
     db.add(WeComMessageLog(msgid="wm1", msgtype="text", status="received"))
     db.commit()

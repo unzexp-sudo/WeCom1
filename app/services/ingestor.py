@@ -299,6 +299,47 @@ def ingest_entry(db, entry: dict, *, erp=None, api=None, storage=None) -> Ingest
     row = _row_from(norm)
 
     try:
+        # --- 1b. ingest scope gate (opt-in, §4.4a) --------------------------
+        # The archive is a firehose: it returns every conversation in the corp
+        # — internal chats, 1:1s, groups with nothing to do with orders. The
+        # staff deny-list below can only exclude people someone remembered to
+        # list, so this is the allow-list counterpart. Opt-in; default off.
+        #
+        # Placed ABOVE identity resolution on purpose. Down there it would
+        # still write a contact row and a group row for every unrelated
+        # conversation, and `resolve_customer` would fire a real ERP lookup
+        # whenever the text carried a phone number — i.e. the firehose would
+        # still flood the ERP, just without creating orders. Nothing below
+        # this point needs to have run for the gate to decide.
+        #
+        # Fails OPEN on an empty allow-list. If the operator switches this on
+        # without naming any group, filtering would drop 100% of orders; a
+        # noisy queue is recoverable and a dropped order is not. `/wecom/health`
+        # reports the misconfiguration.
+        if settings.ingest_only_order_groups:
+            allowed = set(settings.order_group_list())
+            chat_id = norm.get("chat_id")
+            if not allowed:
+                logger.error(
+                    "WECOM_INGEST_ONLY_ORDER_GROUPS is on but WECOM_ORDER_GROUP_IDS "
+                    "is empty — the gate is DISABLED and every conversation will be "
+                    "ingested. Set the group list to enable it."
+                )
+            elif not chat_id or chat_id not in allowed:
+                logger.info(
+                    "Ignoring msgid=%s: chat_id=%s is not in WECOM_ORDER_GROUP_IDS",
+                    msgid,
+                    chat_id or "(none — 1:1 or unknown)",
+                )
+                row.status = "ignored"
+                _persist(db, row)
+                return IngestResult(
+                    msgid=msgid,
+                    status="ignored",
+                    customer_id=row.customer_id,
+                    bind_status=row.bind_status,
+                )
+
         # --- 2. identity (§5) ----------------------------------------------
         from app.services.identity import is_internal_sender, resolve_customer, upsert_contact, upsert_group
 

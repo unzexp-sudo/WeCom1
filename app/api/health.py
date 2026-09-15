@@ -77,11 +77,19 @@ def _config_readiness() -> dict:
             "ingested as a customer order. This is the single most damaging "
             "omission once the archive is on."
         )
-    if not groups:
+    if not groups and settings.ingest_only_order_groups:
         warnings.append(
-            "WECOM_ORDER_GROUP_IDS is empty and nothing filters on "
-            "is_order_group — every conversation the archive returns will be "
-            "ingested, internal or not."
+            "WECOM_INGEST_ONLY_ORDER_GROUPS is ON but WECOM_ORDER_GROUP_IDS is "
+            "empty — the gate deliberately fails OPEN, so every conversation "
+            "the archive returns is still being ingested. Name your order "
+            "groups to actually enable it."
+        )
+    elif not groups:
+        warnings.append(
+            "WECOM_ORDER_GROUP_IDS is empty and WECOM_INGEST_ONLY_ORDER_GROUPS "
+            "is off — every conversation the archive returns will be ingested, "
+            "internal or not. Set the group list and switch the gate on to "
+            "scope intake to your order groups."
         )
     if "127.0.0.1" in media_base or "localhost" in media_base:
         warnings.append(
@@ -122,6 +130,7 @@ def _config_readiness() -> dict:
     return {
         "staff_userids_count": len(staff),
         "order_group_ids_count": len(groups),
+        "ingest_only_order_groups": bool(settings.ingest_only_order_groups),
         "internal_ops_chat_id_set": bool((settings.internal_ops_chat_id or "").strip()),
         "send_allowlist_count": len(allow),
         "media_url_base": media_base,
