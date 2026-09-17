@@ -86,7 +86,18 @@ TOKEN_TTL_SECONDS = 7000
 
 
 class WeComApiError(RuntimeError):
-    pass
+    """A WeCom call failed. `errcode` carries the vendor code when there was one.
+
+    Kept as a FIELD rather than only inside the message, because the fix differs
+    per code and callers must not regex it back out of a string: 60020 is a
+    Trusted-IP problem and 60011 is a missing permission, and those are opposite
+    console actions. A caller that guessed between them would send the operator to
+    the wrong page — which is exactly what this class was added to stop.
+    """
+
+    def __init__(self, message: str, *, errcode: int | None = None) -> None:
+        super().__init__(message)
+        self.errcode = errcode
 
 
 class WeComApi(Protocol):
@@ -441,7 +452,8 @@ class RealWeComApi:
                 payload = _json_or_raise(r, "externalcontact/groupchat/list")
             if payload.get("errcode"):
                 raise WeComApiError(
-                    f"groupchat/list failed: {payload.get('errcode')} {payload.get('errmsg')}"
+                    f"groupchat/list failed: {payload.get('errcode')} {payload.get('errmsg')}",
+                    errcode=payload.get("errcode"),
                 )
             out.extend(
                 g for g in (payload.get("group_chat_list") or []) if isinstance(g, dict)

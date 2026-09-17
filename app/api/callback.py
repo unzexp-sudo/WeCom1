@@ -557,13 +557,44 @@ def archive_consent(roomid: str | None = Query(default=None)) -> dict:
         except WeComApiError as exc:
             out["ok"] = False
             out["discovery_error"] = str(exc)
-            out["hint"] = (
-                "Could not list 客户群. errcode 60011 means the app is missing the "
-                "客户联系 permission — grant it, or call this endpoint with "
-                "?roomid=<wr...> once you have a room id from a message. The room "
-                "id is the `chatid` on an archived message and also the group's id "
-                "in the console."
+            # Branch on the vendor code, never on the message text. 60020 and
+            # 60011 are both "you may not call this", and their fixes are on
+            # DIFFERENT console pages — guessing between them sends the operator
+            # to the wrong one, which is how a one-line fix becomes a day.
+            code = getattr(exc, "errcode", None)
+            tail = (
+                " You can also skip discovery entirely and pass a room id: "
+                "?roomid=<wr...>, taken from the `chatid` of an archived message "
+                "or the group's id in the console."
             )
+            if code == 60020:
+                out["hint"] = (
+                    "The APP secret is rejected from this service's address. "
+                    "errcode 60020 is 'not allow to access from your ip', and the "
+                    "address to whitelist is the `from ip:` shown in the error "
+                    "above. This is a SEPARATE list from the archive's — the "
+                    "archive secret already works from the very same address, "
+                    "which is exactly why every archive probe passes while this "
+                    "one fails. Add the address to the self-built app's Trusted "
+                    "IP list on the APP's own page, not on the Message Archiving "
+                    "page. This also matters beyond this probe: outbound "
+                    "POST /wecom/send uses the same app secret from the same "
+                    "address, so it will fail the same way until this is fixed."
+                    + tail
+                )
+            elif code == 60011:
+                out["hint"] = (
+                    "errcode 60011: the app is missing the 客户联系 (External "
+                    "Contact) permission, so it may not list 客户群. Grant that "
+                    "permission to the app, or use the archive's own consent call "
+                    "directly with a room id." + tail
+                )
+            else:
+                out["hint"] = (
+                    "Could not list 客户群. errcode 60020 means this service's "
+                    "address is missing from the APP's Trusted IP list; errcode "
+                    "60011 means the app lacks the 客户联系 permission." + tail
+                )
             return out
         except Exception as exc:  # noqa: BLE001 - report, never 500
             logger.exception("Consent probe: customer-group listing failed")

@@ -420,7 +420,9 @@ def test_archive_consent_reports_a_missing_external_contact_permission(
     _patch_consent_api(
         monkeypatch,
         _FakeConsentApi(
-            list_error=WeComApiError("groupchat/list failed: 60011 no privilege")
+            list_error=WeComApiError(
+                "groupchat/list failed: 60011 no privilege", errcode=60011
+            )
         ),
     )
 
@@ -430,6 +432,39 @@ def test_archive_consent_reports_a_missing_external_contact_permission(
     assert body["ok"] is False
     assert "60011" in body["discovery_error"]
     assert "客户联系" in body["hint"]
+    # 60011 must NOT be reported as an IP problem — opposite console pages.
+    assert "Trusted IP" not in body["hint"]
+
+
+def test_archive_consent_names_trusted_ip_for_errcode_60020(client, monkeypatch):
+    """60020 is the APP's Trusted IP list, and it is a different list from the
+    archive's — the archive calls work from the very same address, which is what
+    makes this failure read as a permissions bug."""
+    from app.adapters.wecom_api import WeComApiError
+
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "captainape")
+    _patch_consent_api(
+        monkeypatch,
+        _FakeConsentApi(
+            list_error=WeComApiError(
+                "groupchat/list failed: 60020 not allow to access from your ip, "
+                "from ip: 203.0.113.9",
+                errcode=60020,
+            )
+        ),
+    )
+
+    res = client.get("/wecom/archive/consent", headers={"X-Gateway-Key": "test-key"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is False
+    assert "60020" in body["discovery_error"]
+    assert "Trusted IP" in body["hint"]
+    # The two codes must never be conflated.
+    assert "客户联系 permission" not in body["hint"]
+    # And the consequence the operator would otherwise miss.
+    assert "/wecom/send" in body["hint"]
 
 
 def test_archive_consent_uses_an_explicit_roomid_without_discovery(
