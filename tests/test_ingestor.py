@@ -263,3 +263,48 @@ def test_scope_gate_fails_open_on_an_empty_allow_list(
     result = ingestor.ingest_entry(db, text_entry(), erp=mock_erp, api=mock_api, storage=storage)
 
     assert result.status == "handed_off"
+
+
+def test_an_unrecognised_msgtype_records_why_it_was_ignored(
+    db, mock_erp, mock_api, storage
+):
+    """Regression guard for an ignore that left no trace at all.
+
+    `normalize_entry` collapses every unrecognised type to "other", and the
+    ingestor then dropped it with no log line and `error` left NULL. A real
+    customer message archived in a type this build does not route (link,
+    emotion, video, location, ...) therefore produced the same row as a message
+    that never arrived: status "ignored", error null, fabricated `nomsgid-...`.
+    Nothing recorded WHICH type was not understood — the one fact needed to fix
+    it. Seen live: two archived entries were ignored exactly this way.
+    """
+    entry = dict(text_entry())
+    entry["msgid"] = "wmLinkMsgid0001"
+    entry["msgtype"] = "link"
+    entry["link"] = {"title": "订单表", "url": "https://example.com/order.xlsx"}
+
+    result = ingestor.ingest_entry(db, entry, erp=mock_erp, api=mock_api, storage=storage)
+
+    assert result.status == "ignored"
+    # A customer lookup may already have happened; what matters is that no
+    # ORDER was handed to the ERP.
+    assert erp_calls(mock_erp) == []
+    row = db.query(WeComMessageLog).filter_by(msgid="wmLinkMsgid0001").one()
+    assert row.status == "ignored"
+    assert row.error is not None, "an ignored message must say why"
+    assert "link" in row.error
+
+
+def test_an_entry_with_no_msgtype_says_that_instead(db, mock_erp, mock_api, storage):
+    """The other half: a payload carrying no `msgtype` at all must name that
+    fact, rather than reporting an empty unsupported type."""
+    entry = dict(text_entry())
+    entry["msgid"] = "wmNoType0001"
+    entry.pop("msgtype", None)
+
+    result = ingestor.ingest_entry(db, entry, erp=mock_erp, api=mock_api, storage=storage)
+
+    assert result.status == "ignored"
+    row = db.query(WeComMessageLog).filter_by(msgid="wmNoType0001").one()
+    assert row.error is not None
+    assert "no msgtype" in row.error

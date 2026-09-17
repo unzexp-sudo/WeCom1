@@ -493,7 +493,23 @@ def ingest_entry(db, entry: dict, *, erp=None, api=None, storage=None) -> Ingest
         # --- 4. route by msgtype (§4.5) ------------------------------------
         msgtype = norm.get("msgtype")
         if msgtype == "other":
+            # Say WHICH type was not understood. Collapsing every unrecognised
+            # type to "other" is right for ROUTING, but on its own it destroys
+            # the one fact needed to fix it — and an unlogged, unrecorded ignore
+            # is indistinguishable from "the message never arrived". The
+            # customer sees silence; the operator sees a row with no reason.
+            raw = norm.get("raw") if isinstance(norm.get("raw"), dict) else {}
+            sent_type = (raw.get("msgtype") or "").strip() or None
+            reason = (
+                f"unsupported msgtype {sent_type!r} — this build routes only "
+                "text, image, file, voice and mixed; nothing was sent to the ERP"
+                if sent_type
+                else "archive entry carried no msgtype field; nothing was sent "
+                "to the ERP"
+            )
             row.status = "ignored"
+            row.error = reason
+            logger.warning("Ignoring archive entry msgid=%s: %s", msgid, reason)
             _persist(db, row)
             return IngestResult(
                 msgid=msgid, status="ignored", customer_id=row.customer_id, bind_status=row.bind_status
