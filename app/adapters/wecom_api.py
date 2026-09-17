@@ -177,6 +177,9 @@ class MockWeComApi:
         # that a gate (e.g. WECOM_SEND_ALLOWLIST) stopped something *before*
         # it reached WeCom, rather than only checking the returned status.
         self.sent: list[dict[str, Any]] = []
+        # Filled by `get_chat_data`. See `RealWeComApi.get_chat_data` — the mock
+        # publishes it too so both adapters answer the same questions.
+        self.last_pull_stats: dict[str, int] = {}
 
     def get_access_token(self) -> str:
         return "mock-access-token"
@@ -192,7 +195,9 @@ class MockWeComApi:
             if isinstance(data, dict) and int(data.get("seq", 0)) > seq:
                 entries.append(data)
         entries.sort(key=lambda e: int(e.get("seq", 0)))
-        return entries[:limit]
+        entries = entries[:limit]
+        self.last_pull_stats = {"raw_count": len(entries), "decrypt_failed": 0}
+        return entries
 
     def get_permit_user_list(self) -> list[str]:
         """Mock scope = the configured staff list, so the diagnostic has a shape.
@@ -261,6 +266,10 @@ class RealWeComApi:
     def __init__(self) -> None:
         self._token: str | None = None
         self._token_expires_at: float = 0.0
+        # Filled by `get_chat_data`: how many entries WeCom returned, and how
+        # many of those we could not decrypt. Read by `archive.pull_once` via
+        # `getattr`, so adapters and test fakes that predate it still work.
+        self.last_pull_stats: dict[str, int] = {}
 
     # --- token -------------------------------------------------------------
 
@@ -318,17 +327,51 @@ class RealWeComApi:
                     f"get_chat_data failed: {payload.get('errcode')} {payload.get('errmsg')}"
                 )
 
+        # Decrypt every entry. One undecryptable entry must not stop the batch —
+        # but the COUNT of failures has to leave this function. Without it,
+        # "WeCom returned 8 entries we could not decrypt" and "WeCom returned
+        # nothing" both surfaced as `fetched: 0, error: null`, which is how a
+        # local key mismatch gets misread as a console/consent problem and
+        # costs days. `last_pull_stats` is what makes the two distinguishable.
+        chatdata = payload.get("chatdata") or []
         decryptor = get_decryptor()
         out: list[dict[str, Any]] = []
-        for raw in payload.get("chatdata", []) or []:
+        decrypt_failed = 0
+        first_error: str | None = None
+        for raw in chatdata:
             try:
                 entry = decrypt_entry(raw, decryptor)
             except Exception as exc:  # noqa: BLE001 - one bad entry must not stop the batch
-                logger.exception("Failed to decrypt archive entry seq=%s", raw.get("seq"))
+                decrypt_failed += 1
+                if first_error is None:
+                    first_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "Failed to decrypt archive entry seq=%s: %s",
+                    raw.get("seq") if isinstance(raw, dict) else None,
+                    exc,
+                )
                 continue
             entry.setdefault("seq", raw.get("seq"))
             entry.setdefault("msgid", raw.get("msgid"))
             out.append(entry)
+
+        self.last_pull_stats = {
+            "raw_count": len(chatdata),
+            "decrypt_failed": decrypt_failed,
+        }
+        if decrypt_failed:
+            logger.error(
+                "Archive decryption failed for %s of %s entries (first: %s). "
+                "The pull reports fetched=%s, and a TOTAL failure is byte-identical "
+                "to an empty archive in the response — hence this ERROR. Usual "
+                "cause: the private key no longer matches the public key currently "
+                "set on the Message Archiving page, because regenerating the pair "
+                "in the console changes which key WeCom encrypts with.",
+                decrypt_failed,
+                len(chatdata),
+                first_error,
+                len(out),
+            )
         return out
 
     def get_permit_user_list(self) -> list[str]:

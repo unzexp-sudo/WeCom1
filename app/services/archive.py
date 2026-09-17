@@ -131,11 +131,26 @@ def pull_once(db, *, api=None, erp=None) -> dict:
             "ingested": 0,
             "skipped": 0,
             "failed": 0,
+            "raw_count": 0,
+            "decrypt_failed": 0,
             "last_seq": start_seq,
             "error": f"{type(exc).__name__}: {exc}",
+            "hint": None,
         }
 
     entries = [e for e in (entries or []) if isinstance(e, dict)]
+
+    # How much WeCom actually handed back, and how much of it we could not read.
+    # `fetched` counts only the entries that survived decryption, so on its own
+    # it CANNOT tell "the archive is empty" apart from "every entry failed to
+    # decrypt" — both read as `fetched: 0, error: null`. The adapter publishes
+    # these two numbers on itself; fakes that predate it simply lack the
+    # attribute, in which case raw_count falls back to the entry count and no
+    # decryption warning is claimed.
+    stats = getattr(api, "last_pull_stats", None) or {}
+    raw_count = int(stats.get("raw_count", len(entries)) or 0)
+    decrypt_failed = int(stats.get("decrypt_failed", 0) or 0)
+
     ingested = 0
     skipped = 0
     failed = 0
@@ -198,13 +213,40 @@ def pull_once(db, *, api=None, erp=None) -> dict:
 
     set_cursor(db, cursor, max_seq)
 
+    # A total decryption failure is the one outcome that looks exactly like a
+    # healthy-but-quiet archive, so say out loud which of the two it is. The
+    # console is the WRONG place to look for this one — which is the whole
+    # reason it is worth a dedicated sentence.
+    hint: str | None = None
+    if raw_count and not entries:
+        hint = (
+            f"WeCom returned {raw_count} archived entr(ies) and NONE could be "
+            f"decrypted (decrypt_failed={decrypt_failed}). This is NOT an empty "
+            "archive, and NOT a consent or public-key problem on the WeCom side "
+            "— it is a key mismatch on THIS side. Check that "
+            "WECOM_ARCHIVE_PRIVATE_KEY_B64 / WECOM_ARCHIVE_PRIVATE_KEY_PATH "
+            "holds the private half of the key pair whose public key is "
+            "currently set on the Message Archiving page, and look for "
+            "'Archive decryption failed' in the gateway logs."
+        )
+    elif decrypt_failed:
+        hint = (
+            f"{decrypt_failed} of {raw_count} archived entr(ies) failed to "
+            "decrypt and were skipped; the rest were ingested. A partial "
+            "failure usually means the public key was regenerated on the "
+            "Message Archiving page partway through this window."
+        )
+
     logger.info(
-        "Archive pull seq>%s: fetched=%s ingested=%s skipped=%s failed=%s → seq=%s",
+        "Archive pull seq>%s: raw=%s fetched=%s ingested=%s skipped=%s failed=%s "
+        "decrypt_failed=%s → seq=%s",
         start_seq,
+        raw_count,
         len(entries),
         ingested,
         skipped,
         failed,
+        decrypt_failed,
         max_seq,
     )
     return {
@@ -212,8 +254,11 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         "ingested": ingested,
         "skipped": skipped,
         "failed": failed,
+        "raw_count": raw_count,
+        "decrypt_failed": decrypt_failed,
         "last_seq": max_seq,
         "error": None,
+        "hint": hint,
     }
 
 

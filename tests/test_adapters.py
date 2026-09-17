@@ -345,6 +345,52 @@ def test_get_chat_data_posts_to_the_path_the_sdk_actually_calls(monkeypatch):
     assert "msgaudit" not in pull_urls[0]
 
 
+def test_get_chat_data_counts_the_entries_it_could_not_decrypt(monkeypatch):
+    """Regression guard for a silent failure that reads as a console problem.
+
+    `get_chat_data` returns only entries that DECRYPTED, and `pull_once` derives
+    `fetched` from that list — so when EVERY entry failed to decrypt the pull
+    reported `fetched: 0, error: null`, byte-identical to a genuinely empty
+    archive. The operator then goes hunting in the WeCom console for a key
+    mismatch that is entirely local. The adapter now publishes how much WeCom
+    returned and how much it could not read, which is what makes the two
+    outcomes distinguishable.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = (
+                '{"errcode":0,"chatdata":['
+                '{"seq":1,"msgid":"m1","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="},'
+                '{"seq":2,"msgid":"m2","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="}]}'
+            )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    def boom(*_args, **_kwargs):
+        raise DecryptError("RSA decrypt failed: the key does not match this blob")
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+    monkeypatch.setattr("app.adapters.decrypt.decrypt_entry", boom)
+
+    api = wa.RealWeComApi()
+    entries = api.get_chat_data(seq=0, limit=10, timeout=5)
+
+    # Nothing survived, so the caller sees an empty list...
+    assert entries == []
+    # ...but the adapter says WHY, which is the whole point.
+    assert api.last_pull_stats == {"raw_count": 2, "decrypt_failed": 2}
+
+
 def test_get_permit_user_list_uses_the_msgaudit_namespace(monkeypatch):
     """The scope probe really IS under `/msgaudit/` — unlike the pull.
 

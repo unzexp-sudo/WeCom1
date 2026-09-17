@@ -86,3 +86,50 @@ def test_pull_once_reports_no_error_on_a_clean_pull(
     rather than on a truthiness accident."""
     summary = archive.pull_once(db, api=mock_api, erp=mock_erp)
     assert summary["error"] is None
+
+
+def test_pull_once_separates_an_empty_archive_from_a_decryption_failure(db):
+    """Regression guard for the ambiguity that sent us to the wrong console.
+
+    `fetched` counts only entries that survived decryption, so a TOTAL
+    decryption failure produced `fetched: 0, error: null` — byte-identical to a
+    genuinely empty archive. `raw_count`, `decrypt_failed` and `hint` are what
+    make the two outcomes tell themselves apart, and the hint must point at the
+    KEY PAIR on this side rather than at the WeCom console.
+    """
+
+    class _AllUndecryptable:
+        """WeCom returned four entries; none of them could be read."""
+
+        def __init__(self) -> None:
+            self.last_pull_stats = {"raw_count": 4, "decrypt_failed": 4}
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    summary = archive.pull_once(db, api=_AllUndecryptable())
+
+    assert summary["fetched"] == 0
+    assert summary["error"] is None  # the API call itself SUCCEEDED
+    assert summary["raw_count"] == 4
+    assert summary["decrypt_failed"] == 4
+    assert summary["hint"] is not None
+    assert "decrypt" in summary["hint"].lower()
+    # The whole point: do not send the operator back to the WeCom console.
+    assert "console" not in summary["hint"].lower()
+
+
+def test_pull_once_claims_no_decryption_failure_when_the_adapter_is_silent(db):
+    """An adapter that predates `last_pull_stats` (or a test fake) must not be
+    reported as having decryption failures it never mentioned."""
+
+    class _NoStats:
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    summary = archive.pull_once(db, api=_NoStats())
+
+    assert summary["fetched"] == 0
+    assert summary["raw_count"] == 0
+    assert summary["decrypt_failed"] == 0
+    assert summary["hint"] is None
