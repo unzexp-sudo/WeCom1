@@ -6,6 +6,8 @@
 | `POST /wecom/callback`          | app message callback → ingestor |
 | `POST /wecom/archive/callback`  | `msgaudit_notify` ping → immediate archive pull |
 | `POST /wecom/archive/pull`      | run one pull synchronously, return the counters |
+| `GET  /wecom/archive/scope`     | which members the archive actually records |
+| `GET  /wecom/archive/egress-ip` | the public IP this service calls WeCom from |
 | `POST /wecom/ingest`            | simulator injection point (already-decrypted entry) |
 
 In mock mode signature verification and decryption are skipped and the body is
@@ -427,3 +429,76 @@ def archive_egress_ip() -> dict:
             errors.append(f"{url}: {exc}")
 
     return {"ok": False, "error": "; ".join(errors) or "no provider answered"}
+
+
+@router.get("/archive/scope", dependencies=[Depends(require_service_key)])
+def archive_scope() -> dict:
+    """Report which members the archive is ACTUALLY recording.
+
+    A pull can succeed and still return nothing forever, and the two causes need
+    **opposite** responses:
+
+    | cause | fix |
+    |---|---|
+    | the 使用范围 resolves to nobody | fix the console — waiting never helps |
+    | the scope is fine, nobody has talked yet | just send a message |
+
+    Both look identical as `fetched: 0` with `error: null`, which is what makes
+    this the most expensive ambiguity in the whole go-live. So ask WeCom the one
+    question that separates them: `msgaudit/get_permit_user_list`
+    (doc `path/91614`) returns the members **in effect**.
+
+    **An empty `scope_userids` is the answer, not an error.** WeCom expands
+    departments and tags to people and then *drops anyone past the purchased
+    headcount* — the doc is explicit: *"返回的userid仅包含实际生效的成员，在开启
+    范围超过购买人数的情况下，不包含超容后不生效的成员userid"*. On a trial capped
+    at one member, a scope set to "whole enterprise" can therefore legitimately
+    resolve to a single, possibly unexpected, person.
+
+    Guarded by `X-Gateway-Key` because it names real employee userids.
+    """
+    from app.adapters.wecom_api import get_wecom_api
+
+    try:
+        ids = get_wecom_api().get_permit_user_list()
+    except Exception as exc:  # noqa: BLE001 - report, never 500
+        logger.warning("Archive scope probe failed: %s", exc)
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": (
+                "HTTP 404 -> the path is wrong. errcode 60020/10009 -> the egress "
+                "IP is not in Trusted IP. An errcode naming the token -> "
+                "WECOM_ARCHIVE_SECRET is wrong."
+            ),
+        }
+
+    configured = settings.staff_list()
+    in_scope = [u for u in configured if u in ids]
+    if not ids:
+        hint = (
+            "scope_count is 0: the archiving scope resolves to NOBODY, so no pull "
+            "will ever return a message. Open the Message Archiving page and set "
+            "the scope to a real member."
+        )
+    elif configured and not in_scope:
+        hint = (
+            "The scope is populated but NONE of your WECOM_STAFF_USERIDS are in "
+            "it. Messages from those accounts are not being recorded, and any "
+            "that were recorded would be treated as customer messages."
+        )
+    else:
+        hint = (
+            "Scope is populated. An empty pull now just means no in-scope member "
+            "has sent a message since archiving was enabled — send one and pull "
+            "again."
+        )
+
+    return {
+        "ok": True,
+        "scope_userids": ids,
+        "scope_count": len(ids),
+        "staff_userids_configured": configured,
+        "staff_in_scope": in_scope,
+        "hint": hint,
+    }

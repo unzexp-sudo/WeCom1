@@ -343,3 +343,89 @@ def test_get_chat_data_posts_to_the_path_the_sdk_actually_calls(monkeypatch):
     assert pull_urls, "no archive pull request was made"
     assert "/cgi-bin/message/getchatdata" in pull_urls[0]
     assert "msgaudit" not in pull_urls[0]
+
+
+def test_get_permit_user_list_uses_the_msgaudit_namespace(monkeypatch):
+    """The scope probe really IS under `/msgaudit/` — unlike the pull.
+
+    This is the counterpart to the regression guard above, and it is here so the
+    two paths cannot be "unified" by a future reader who notices the asymmetry
+    and assumes one of them is a typo. `/msgaudit/get_permit_user_list` answers
+    200 with a JSON body; `/msgaudit/get_chat_data` answers 404 with nothing.
+    """
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = '{"errcode":0,"errmsg":"ok","ids":["zhangsan","lisi"]}'
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+
+    assert wa.RealWeComApi().get_permit_user_list() == ["zhangsan", "lisi"]
+
+    probe_urls = [u for u in urls if "gettoken" not in u]
+    assert probe_urls, "no scope probe request was made"
+    assert "/cgi-bin/msgaudit/get_permit_user_list" in probe_urls[0]
+
+
+def test_get_permit_user_list_treats_an_empty_scope_as_a_result(monkeypatch):
+    """An empty scope is the *answer* to "why is the pull empty?", not a fault.
+
+    Returning `[]` rather than raising is what lets the endpoint distinguish
+    "nobody is in scope" from "the call failed" — the two need opposite fixes.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = '{"errcode":0,"errmsg":"ok","ids":[]}'
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+
+    assert wa.RealWeComApi().get_permit_user_list() == []
+
+
+def test_get_permit_user_list_raises_on_an_errcode(monkeypatch):
+    """A real refusal must stay an error, or the endpoint cannot tell it from an
+    empty scope."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = '{"errcode":60020,"errmsg":"not allow to access from your ip"}'
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+
+    try:
+        wa.RealWeComApi().get_permit_user_list()
+    except wa.WeComApiError as exc:
+        assert "60020" in str(exc)
+    else:
+        raise AssertionError("expected WeComApiError for errcode 60020")

@@ -36,6 +36,20 @@ WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 # looks right, so the 404 reads like a permissions problem rather than a typo.
 ARCHIVE_PULL_PATH = "/message/getchatdata"
 ARCHIVE_MEDIA_PATH = "/message/getchatmediadata"
+
+# Which members the archive is ACTUALLY recording (doc `path/91614`,
+# 获取会话内容存档开启成员列表). This is the endpoint that answers "why is the
+# pull empty?" — an empty `ids` means the 使用范围 resolves to nobody, and no
+# amount of waiting will ever produce a message.
+#
+# Note the doc's caveat, which matters on a trial: *"返回的userid仅包含实际生效
+# 的成员，在开启范围超过购买人数的情况下，不包含超容后不生效的成员userid"* — a
+# scope wider than the purchased headcount silently yields FEWER members than were
+# configured, with no error anywhere. The trial here allows exactly 1 member.
+#
+# Unlike the pull, this one really does live under `/msgaudit/` — the namespace is
+# genuine, which is exactly what made the pull path so easy to get wrong.
+ARCHIVE_PERMIT_LIST_PATH = "/msgaudit/get_permit_user_list"
 TOKEN_TTL_SECONDS = 7000
 
 
@@ -47,6 +61,8 @@ class WeComApi(Protocol):
     def get_access_token(self) -> str: ...
 
     def get_chat_data(self, seq: int, limit: int, timeout: int) -> list[dict[str, Any]]: ...
+
+    def get_permit_user_list(self) -> list[str]: ...
 
     def download_media(self, sdkfileid: str, filename: str | None = None) -> tuple[bytes, str | None]: ...
 
@@ -134,6 +150,15 @@ class MockWeComApi:
                 entries.append(data)
         entries.sort(key=lambda e: int(e.get("seq", 0)))
         return entries[:limit]
+
+    def get_permit_user_list(self) -> list[str]:
+        """Mock scope = the configured staff list, so the diagnostic has a shape.
+
+        Deliberately NOT empty: an empty list means "the scope resolves to
+        nobody", and a mock that always reported that would train the reader to
+        ignore the field.
+        """
+        return settings.staff_list()
 
     def download_media(self, sdkfileid: str, filename: str | None = None) -> tuple[bytes, str | None]:
         matches = sorted(self.media_dir.glob(f"{Path(sdkfileid).stem}.*")) or sorted(
@@ -235,6 +260,30 @@ class RealWeComApi:
             entry.setdefault("msgid", raw.get("msgid"))
             out.append(entry)
         return out
+
+    def get_permit_user_list(self) -> list[str]:
+        """The userids the archive is ACTUALLY recording (doc `path/91614`).
+
+        Returns the members that are in effect, not the members that were
+        configured: the API expands departments/tags to people and then drops
+        anyone past the purchased headcount. So an empty list is a definitive
+        "the scope resolves to nobody" — the one answer that turns an empty pull
+        from a mystery into a console fix.
+        """
+        with _client() as c:
+            r = c.post(
+                f"{WECOM_API_BASE}{ARCHIVE_PERMIT_LIST_PATH}",
+                params={"access_token": self.get_access_token(use_archive_secret=True)},
+                json={},
+            )
+            payload = _json_or_raise(r, "msgaudit/get_permit_user_list")
+
+        errcode = payload.get("errcode")
+        if errcode:
+            raise WeComApiError(
+                f"get_permit_user_list failed: {errcode} {payload.get('errmsg')}"
+            )
+        return [str(u) for u in (payload.get("ids") or []) if u]
 
     # --- media -------------------------------------------------------------
 

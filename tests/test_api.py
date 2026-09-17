@@ -164,6 +164,80 @@ def test_archive_egress_ip_reports_failure_instead_of_raising(client, monkeypatc
     assert "no route to host" in body["error"]
 
 
+class _FakeScopeApi:
+    """Stands in for the WeCom client at the `/wecom/archive/scope` boundary."""
+
+    def __init__(self, ids=None, error=None) -> None:
+        self._ids = ids if ids is not None else []
+        self._error = error
+
+    def get_permit_user_list(self) -> list[str]:
+        if self._error is not None:
+            raise self._error
+        return list(self._ids)
+
+
+def _patch_scope_api(monkeypatch, api) -> None:
+    import app.adapters.wecom_api as wa
+
+    monkeypatch.setattr(wa, "get_wecom_api", lambda: api)
+
+
+def test_archive_scope_is_guarded(client, monkeypatch):
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    assert client.get("/wecom/archive/scope").status_code == 401
+
+
+def test_archive_scope_reports_an_empty_scope_as_the_answer(client, monkeypatch):
+    """`scope_count: 0` is a successful probe whose answer is "fix the console".
+
+    If this raised instead, the reader could not tell it apart from a network
+    failure — and those two need opposite responses.
+    """
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "zhangsan")
+    _patch_scope_api(monkeypatch, _FakeScopeApi(ids=[]))
+
+    res = client.get("/wecom/archive/scope", headers={"X-Gateway-Key": "test-key"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["scope_count"] == 0
+    assert body["scope_userids"] == []
+    assert "NOBODY" in body["hint"] or "nobody" in body["hint"].lower()
+
+
+def test_archive_scope_flags_configured_staff_that_are_not_in_scope(client, monkeypatch):
+    """The dangerous misconfiguration: messages from an account the operator
+    believes is a staff member would be ingested as customer messages."""
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "zhangsan,lisi")
+    _patch_scope_api(monkeypatch, _FakeScopeApi(ids=["lisi", "wangwu"]))
+
+    res = client.get("/wecom/archive/scope", headers={"X-Gateway-Key": "test-key"})
+    body = res.json()
+    assert body["ok"] is True
+    assert body["scope_count"] == 2
+    assert body["staff_userids_configured"] == ["zhangsan", "lisi"]
+    assert body["staff_in_scope"] == ["lisi"]
+    assert "zhangsan" not in body["staff_in_scope"]
+
+
+def test_archive_scope_reports_a_failure_instead_of_raising(client, monkeypatch):
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    _patch_scope_api(
+        monkeypatch,
+        _FakeScopeApi(error=RuntimeError("60020 not allow to access from your ip")),
+    )
+
+    res = client.get("/wecom/archive/scope", headers={"X-Gateway-Key": "test-key"})
+    assert res.status_code == 200  # never 500 — this is a diagnostic
+    body = res.json()
+    assert body["ok"] is False
+    assert "60020" in body["error"]
+    assert "hint" in body
+
+
 def test_messages_list_uses_the_pagination_contract(client, db):
     db.add(WeComMessageLog(msgid="wm1", msgtype="text", status="received"))
     db.commit()
