@@ -115,6 +115,24 @@ def _config_readiness() -> dict:
                 "/wecom/media. The gateway serves attachments at "
                 "/wecom/media/{filename}, so every file_url will 404."
             )
+    # Media is the one thing `pure` cannot do. Every archive attachment
+    # (image/file/voice/mixed) goes through `download_media`, which needs the
+    # official C SDK and raises under `pure`. That matters more than it sounds:
+    # a customer order usually IS an attachment, and `pull_once` deliberately
+    # holds the cursor on a failed entry, so the first attachment would block
+    # every later message behind it — and `POST /wecom/messages/{id}/rehand`
+    # re-runs the same failing download, so it cannot clear it either.
+    provider = (settings.decrypt_provider or "pure").strip().lower()
+    if provider != "sdk":
+        warnings.append(
+            f"WECOM_DECRYPT_PROVIDER is {provider!r}, so archived ATTACHMENTS "
+            "cannot be downloaded. Text still ingests, but the first image/file/"
+            "voice message will fail, and a failed entry HOLDS THE ARCHIVE "
+            "CURSOR — blocking every later message behind it, with rehand unable "
+            "to clear it (it repeats the same download). Set the provider to "
+            "'sdk' and WECOM_ARCHIVE_SDK_PATH before real orders, which are "
+            "attachments, start arriving."
+        )
     if key_path and not os.path.exists(key_path):
         warnings.append(
             f"WECOM_ARCHIVE_PRIVATE_KEY_PATH is set but {key_path} does not "
@@ -151,6 +169,7 @@ def _config_readiness() -> dict:
             (settings.archive_private_key_b64 or "").strip()
         ),
         "decrypt_provider": settings.decrypt_provider,
+        "archive_sdk_path_set": bool((settings.archive_sdk_path or "").strip()),
         "corp_id_set": bool((settings.corp_id or "").strip()),
         "warnings": warnings,
     }

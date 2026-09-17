@@ -96,6 +96,31 @@ def test_health_points_at_the_gate_switch_when_it_is_off(client, monkeypatch):
     assert not any("fails OPEN" in w for w in warnings)
 
 
+def test_health_warns_that_pure_cannot_download_attachments(client, monkeypatch):
+    """`pure` decrypts messages but cannot fetch media, and a failed entry holds
+    the archive cursor — so the first attachment blocks everything behind it, and
+    rehand repeats the same failing download. Health has to say this *before* it
+    happens, because the symptom (a stalled cursor) points nowhere near the cause.
+    """
+    monkeypatch.setattr(settings, "decrypt_provider", "pure")
+
+    body = client.get("/wecom/health").json()
+    warnings = body["config"]["warnings"]
+    assert any("ATTACHMENTS" in w for w in warnings)
+    assert any("HOLDS THE ARCHIVE CURSOR" in w for w in warnings)
+    assert body["config"]["archive_sdk_path_set"] is False
+
+
+def test_health_does_not_warn_about_media_under_the_sdk_provider(client, monkeypatch):
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    monkeypatch.setattr(settings, "archive_sdk_path", "/app/lib/libWeWorkFinanceSdk_C.so")
+
+    body = client.get("/wecom/health").json()
+    warnings = body["config"]["warnings"]
+    assert not any("ATTACHMENTS" in w for w in warnings)
+    assert body["config"]["archive_sdk_path_set"] is True
+
+
 def test_archive_egress_ip_is_guarded_and_reports_the_ip(client, monkeypatch):
     """The 可信IP whitelist is a static list, so "what IP am I calling from?"
     has to be answerable at runtime — a rotated egress IP otherwise looks
