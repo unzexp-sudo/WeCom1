@@ -142,31 +142,6 @@ def decrypt(encrypted_body_b64: str) -> str:
     return plain_bytes.decode("utf-8", errors="replace")
 
 
-def decrypt_with(
-    encrypted_body_b64: str,
-    *,
-    aes_key: str,
-    receiveid: str = "",
-) -> str:
-    """Decrypt a callback body with an explicit AES key (no settings lookup).
-
-    Used by the smart-bot (智能机器人) callback, which has separate credentials
-    (WECOM_BOT_TOKEN / WECOM_BOT_ENCODING_AES_KEY) and does not use the corp
-    ID as its receiveid. `receiveid` is checked-and-logged-only when supplied,
-    matching the self-built-app behaviour.
-    """
-    key = _aes_key_from(aes_key)
-    plain_bytes, plain_receiveid = _decrypt_with_key(encrypted_body_b64, key)
-
-    expected = (receiveid or "").strip()
-    if expected and plain_receiveid and plain_receiveid != expected:
-        logger.warning(
-            "Callback receiveid %r does not match expected %r", plain_receiveid, expected
-        )
-
-    return plain_bytes.decode("utf-8", errors="replace")
-
-
 def encrypt(plaintext: str) -> str:
     """Encrypt a reply body (used for passive replies to WeCom callbacks)."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes

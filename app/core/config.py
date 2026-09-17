@@ -46,34 +46,6 @@ class Settings(BaseSettings):
     token: str = ""
     encoding_aes_key: str = ""
 
-    # --- Smart-bot (智能机器人) credentials -----------------------------------
-    # Same crypto scheme as the self-built app, but with a separate Token and
-    # EncodingAESKey the admin sets in the smart-bot's "URL 回调" config. Empty
-    # defaults keep the service mock-safe; URL verification only enforces
-    # signature + decryption when both are configured (matching the self-built
-    # app callback behaviour — see app/api/callback.py).
-    bot_token: str = ""
-    bot_encoding_aes_key: str = ""
-
-    # --- Smart-bot inline replies --------------------------------------------
-    # Each smart-bot callback carries a one-shot `response_url` the gateway can
-    # POST to in order to answer that message in place. Toggle with
-    # WECOM_BOT_REPLY_ENABLED; leave the text empty to use the bilingual
-    # default in app/services/bot_reply.py.
-    bot_reply_enabled: bool = True
-    bot_reply_text: str = ""
-
-    # --- Smart-bot internal senders -----------------------------------------
-    # The internal-sender filter exists to keep AMBIENT staff chatter out of the
-    # order queue. A smart bot never sees ambient chatter: WeCom only delivers
-    # messages in which the bot is @-mentioned, so every bot message is already
-    # a deliberate act. Without this our own staff could never test the bot in
-    # an internal group — their order would be dropped as "internal" and the
-    # bot would stay silent. Nothing here weakens mandatory human review: the
-    # message still lands in the intake queue for a person to confirm.
-    # Set WECOM_BOT_INGEST_INTERNAL=false to restore the strict filter.
-    bot_ingest_internal: bool = True
-
     # --- Session archive ------------------------------------------------------
     # The 会话内容存档 (Session Archive) secret, from 管理工具 → 聊天内容存档.
     # This is DISTINCT from WECOM_SECRET (the self-built app secret used for

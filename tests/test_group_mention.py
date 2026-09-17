@@ -1,4 +1,4 @@
-"""App-callback group @-mention capture (the "smart bot" flow).
+"""App-callback group attribution: carry `RoomId` through as `chat_id`.
 
 When the self-built WeCom app is added to a group and a user @-mentions it,
 WeCom delivers the message with a `RoomId` field. The gateway must carry that
@@ -6,8 +6,14 @@ through so the message is attributed to the GROUP (chat_id == roomid) and routed
 as a group message — not mis-classified as a 1:1 DM (which would resolve the
 wrong counterparty).
 
-This is the mechanism behind "make a bot in the WeCom console, add it to a group,
-users @-tag it and it listens."
+This is the APP callback, NOT the 智能机器人 (Smart Robot) callback. The Smart
+Robot was retired: it cannot be added to external customer groups, and its
+conversations are not archivable at all. The `@bot` in the fixtures below is
+example message text and nothing more.
+
+The app callback itself cannot be configured on a PaaS host either — the console
+enforces domain-entity (备案主体) verification, which a `*.up.railway.app`
+hostname can never pass. It is kept for a future owned domain.
 """
 from __future__ import annotations
 

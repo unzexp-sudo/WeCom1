@@ -380,14 +380,14 @@ def ingest_entry(db, entry: dict, *, erp=None, api=None, storage=None) -> Ingest
         row.bind_status = "bound" if customer_id else "unresolved"
 
         # --- 3. internal staff / ops chat (§4.3, §4.4) ----------------------
-        # A smart-bot message only exists because someone @-mentioned the bot,
-        # so it is deliberate rather than ambient chatter. Let it through unless
-        # the operator opted back into the strict filter (see
-        # settings.bot_ingest_internal) — otherwise our own staff can never
-        # test the bot in an internal group.
-        raw_entry = norm["raw"] if isinstance(norm["raw"], dict) else {}
-        is_bot_message = bool(raw_entry.get("_bot"))
-        if not (is_bot_message and settings.bot_ingest_internal) and is_internal_sender(
+        # Unconditional. This used to have one exception: a smart-bot message
+        # (recognised by the `_bot` sidecar) skipped the filter when
+        # `WECOM_BOT_INGEST_INTERNAL` was on, which it was by default. That
+        # route is retired — it could never reach an external customer group
+        # anyway, and its conversations are not archivable — so the filter no
+        # longer has a bypass. That matters because the staff list is a
+        # DENY-LIST: anything it fails to match is treated as a customer.
+        if is_internal_sender(
             db,
             sender_userid=norm.get("sender_userid"),
             external_userid=norm.get("external_userid"),
