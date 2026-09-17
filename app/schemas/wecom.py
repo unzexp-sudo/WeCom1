@@ -164,6 +164,23 @@ class MessageOut(BaseModel):
     created_at: datetime
 
 
+class MessageDetailOut(MessageOut):
+    """Single-message view, with the decrypted archive entry attached.
+
+    Kept OFF the list response on purpose — it is large, and a page of 50 would
+    carry 50 raw payloads nobody asked for.
+
+    Why it exists: `external_userid` and `sender_userid` are opaque to a human,
+    and with the customer-contact app retired the gateway has no way to resolve
+    them to a name. So "who sent this?" is only answerable from the payload
+    WeCom actually delivered — which fields were present, what `roomid` was, and
+    what `msgtype` the entry really carried before it was collapsed to "other".
+    Without it, a sender id is an unfalsifiable guess.
+    """
+
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
 class OutboundOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

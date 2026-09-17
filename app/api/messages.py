@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.wecom import WeComMessageLog
-from app.schemas.wecom import MessageOut
+from app.schemas.wecom import MessageDetailOut, MessageOut
 
 logger = logging.getLogger("wecom.api.messages")
 
@@ -51,8 +51,15 @@ def list_messages(
 
 
 @router.get("/messages/{message_id}")
-def get_message(message_id: str, db: Session = Depends(get_db)) -> MessageOut:
-    return MessageOut.model_validate(_get_message(db, message_id))
+def get_message(message_id: str, db: Session = Depends(get_db)) -> MessageDetailOut:
+    """One message, including the decrypted archive entry it came from.
+
+    The detail view carries `raw` because a sender id is opaque and, with the
+    customer-contact app retired, unresolvable to a name — so identifying who
+    sent a message, or which `msgtype` WeCom really delivered, is only possible
+    from the payload itself.
+    """
+    return MessageDetailOut.model_validate(_get_message(db, message_id))
 
 
 @router.post("/messages/{message_id}/rehand")
