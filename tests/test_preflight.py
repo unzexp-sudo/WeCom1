@@ -6,11 +6,14 @@ module rather than by calling `main()` against the live WeCom API.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import pathlib
 import sys
 
 import pytest
+
+from app.adapters import wecom_api as wa
 
 SCRIPT = (
     pathlib.Path(__file__).resolve().parents[1] / "scripts" / "preflight.py"
@@ -73,3 +76,45 @@ def test_unrelated_errors_produce_no_ip(preflight):
 def test_loading_the_script_does_not_change_the_mode(preflight):
     """Preflight is read-only: it must never flip the service into live mode."""
     assert preflight.settings.mode.strip().lower() == "mock"
+
+
+def test_preflight_probes_the_path_the_sdk_actually_calls(preflight):
+    """The preflight is the script the README tells you to run before going
+    live, so a wrong path here reports a working archive as broken.
+
+    It used to hard-code the `/msgaudit/` spelling, which 404s with an empty
+    body. It now imports the shared constant, and this test pins both halves of
+    that: the value itself, and the fact that it is the same object the adapter
+    uses (so the two cannot drift apart again).
+    """
+    assert preflight.ARCHIVE_PULL_PATH == wa.ARCHIVE_PULL_PATH
+    assert preflight.ARCHIVE_PULL_PATH == "/message/getchatdata"
+
+
+def test_no_module_calls_the_404_archive_pull_path():
+    """Repo-wide drift guard for the bug that blocked the first live pull.
+
+    `/cgi-bin/msgaudit/get_chat_data` answers HTTP 404 with an empty body, so
+    any code that actually calls it is dead on arrival. Comments that NAME the
+    wrong spelling are fine — they are how the next reader avoids it — so this
+    walks the AST and inspects only string LITERALS, which is what a call site
+    would use. (A plain text search cannot tell the two apart, and would have to
+    be deleted the first time someone documented the trap.)
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for folder in ("app", "scripts", "simulator"):
+        for path in sorted((root / folder).rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and "msgaudit/get_chat_data" in node.value
+                ):
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+
+    assert not offenders, (
+        "the archive pull path is /cgi-bin/message/getchatdata (ARCHIVE_PULL_PATH). "
+        f"These string literals still use the 404 spelling: {offenders}"
+    )

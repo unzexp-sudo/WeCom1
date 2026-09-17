@@ -77,8 +77,9 @@ class Settings(BaseSettings):
     # --- Session archive ------------------------------------------------------
     # The 会话内容存档 (Session Archive) secret, from 管理工具 → 聊天内容存档.
     # This is DISTINCT from WECOM_SECRET (the self-built app secret used for
-    # outbound send). Both the `msgaudit/get_chat_data` access token and the
-    # finance SDK `Init()` require THIS secret, not the app secret.
+    # outbound send). Both the archive access token (for the `message/getchatdata`
+    # pull — see `ARCHIVE_PULL_PATH` in app/adapters/wecom_api.py) and the finance
+    # SDK `Init()` require THIS secret, not the app secret.
     #
     # NOTE: an earlier version of this comment claimed an empty value "falls
     # back to WECOM_SECRET so single-secret setups still boot". That fallback

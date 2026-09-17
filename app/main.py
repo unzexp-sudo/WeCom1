@@ -65,9 +65,10 @@ async def lifespan(_: FastAPI):
     #    never sends one. Archive data expires after 5 days, so that is a real
     #    way to lose orders.
     #
-    # The pull is OUTBOUND (POST to qyapi.weixin.qq.com/cgi-bin/msgaudit/
-    # get_chat_data), which is why this path needs no public callback URL, no
-    # domain, and no WeCom domain-entity verification.
+    # The pull is OUTBOUND (POST to qyapi.weixin.qq.com/cgi-bin/message/
+    # getchatdata — see `ARCHIVE_PULL_PATH`; the `/msgaudit/` spelling 404s),
+    # which is why this path needs no public callback URL, no domain, and no
+    # WeCom domain-entity verification.
     try:
         from app.services.archive import materialize_private_key
 

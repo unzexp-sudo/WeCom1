@@ -37,6 +37,12 @@ os.chdir(GATEWAY_DIR)
 
 import httpx  # noqa: E402
 
+# Import the pull path rather than spelling it out here. This script previously
+# hard-coded `/msgaudit/get_chat_data`, which is the ONE spelling that 404s with
+# an empty body — so the preflight the README tells you to run before going live
+# reported the archive as broken even after it worked. Importing the constant
+# makes that drift impossible.
+from app.adapters.wecom_api import ARCHIVE_PULL_PATH  # noqa: E402
 from app.core.config import settings  # noqa: E402
 
 # Put the caller back where they were — this module is also imported by tests,
@@ -151,7 +157,7 @@ def main() -> int:
     # The archive is the ONLY inbound path for real customer orders (the smart
     # bot is internal-groups-only), so this check matters more than the send
     # checks above. It is read-only: `get_chat_data` pulls, it never sends.
-    print("\nSession Archive  (POST /cgi-bin/msgaudit/get_chat_data)")
+    print(f"\nSession Archive  (POST /cgi-bin{ARCHIVE_PULL_PATH})")
     print("-" * 60)
     archive_secret = (settings.archive_secret or "").strip()
     if not archive_secret:
@@ -182,28 +188,57 @@ def main() -> int:
             atoken = adata["access_token"]
             # limit=1 keeps the probe cheap. This is a READ; nothing is sent.
             resp = client.post(
-                f"{BASE}/msgaudit/get_chat_data",
+                f"{BASE}{ARCHIVE_PULL_PATH}",
                 params={"access_token": atoken},
                 json={"seq": 0, "limit": 1, "timeout": settings.archive_timeout},
             )
-            gdata = resp.json()
-            gerr = gdata.get("errcode")
-            if gerr == 0:
-                n = len(gdata.get("chatdata", []) or [])
-                print(f"{OK}get_chat_data reachable (returned {n} entr{'y' if n == 1 else 'ies'})")
-                print(f"{INFO}The archive is pullable from this IP. Inbound is live-capable.")
-            else:
-                errmsg = gdata.get("errmsg", "")
-                ip_match = IP_RE.search(errmsg)
-                print(f"{NO}get_chat_data errcode={gerr} errmsg={errmsg}")
-                if gerr == 60020 and ip_match:
-                    print(f"\n{INFO}This IP is not allow-listed: {ip_match.group(1)}")
-                    print(f"{INFO}Add it under Admin Console -> My Enterprise -> 可信IP.")
-                    print(f"{INFO}On Railway the egress IP is DYNAMIC — it will change on")
-                    print(f"{INFO}redeploy, so a fixed-IP host or proxy is the real fix.")
-                elif gerr == 60011:
-                    print(f"{INFO}No privilege — the archive is not enabled for this corp.")
+            # A wrong path answers 404 with an EMPTY body, and `.json()` on that
+            # raises JSONDecodeError — which used to escape as a traceback and
+            # tell you nothing. Decode defensively and name the real cause.
+            try:
+                gdata = resp.json()
+            except Exception:  # noqa: BLE001
+                gdata = None
+
+            if gdata is None:
+                print(f"{NO}archive pull returned a non-JSON response: "
+                      f"HTTP {resp.status_code}, "
+                      f"content-type={resp.headers.get('content-type')!r}, "
+                      f"body={resp.text[:120]!r}")
+                print(f"{INFO}A 404 with an empty body means the PATH is wrong, not the "
+                      f"token. The pull lives at /cgi-bin{ARCHIVE_PULL_PATH}.")
+                print(f"{INFO}Do NOT move it under /msgaudit/ — that namespace answers 404 "
+                      f"with an empty body for THIS call, even though sibling /msgaudit/ "
+                      f"paths return proper JSON. See ARCHIVE_PULL_PATH's comment.")
                 blocking += 1
+            else:
+                gerr = gdata.get("errcode")
+                if gerr == 0:
+                    n = len(gdata.get("chatdata", []) or [])
+                    print(f"{OK}archive pull reachable (returned {n} "
+                          f"entr{'y' if n == 1 else 'ies'})")
+                    print(f"{INFO}The archive is pullable from this IP. Inbound is live-capable.")
+                    if n == 0:
+                        print(f"{INFO}0 entries is a normal result, not a failure — it can "
+                              f"mean no in-scope member has sent anything yet. Confirm WHO "
+                              f"is in scope with GET /wecom/archive/scope before assuming "
+                              f"the pull is broken.")
+                else:
+                    errmsg = gdata.get("errmsg", "")
+                    ip_match = IP_RE.search(errmsg)
+                    print(f"{NO}archive pull errcode={gerr} errmsg={errmsg}")
+                    if gerr == 60020 and ip_match:
+                        print(f"\n{INFO}This IP is not allow-listed: {ip_match.group(1)}")
+                        print(f"{INFO}Add it under Admin Console -> My Enterprise -> 可信IP.")
+                        print(f"{INFO}On Railway the egress IP is DYNAMIC — it will change on")
+                        print(f"{INFO}redeploy, so a fixed-IP host or proxy is the real fix.")
+                    elif gerr == 60011:
+                        print(f"{INFO}No privilege — the archive is not enabled for this corp.")
+                    elif gerr == 10009:
+                        print(f"{INFO}10009 = the calling IP is not in the archive's Trusted")
+                        print(f"{INFO}IP list. That list is SEPARATE from 可信IP: set it on")
+                        print(f"{INFO}the Message Archiving page, before you enable it.")
+                    blocking += 1
 
     # --- 5. verdict ------------------------------------------------------
     print("\n" + "=" * 60)
