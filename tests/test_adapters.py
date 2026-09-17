@@ -263,3 +263,45 @@ def test_http_clients_ignore_the_sandbox_proxy():
     for factory in (wa._client, ec._client):
         with factory() as client:
             assert client.trust_env is False
+
+
+def test_json_or_raise_names_the_status_and_body_on_a_non_json_response():
+    """A bare JSONDecodeError said nothing: not which call, not the status, not
+    the body. A non-JSON body is exactly the case that needs all three, because
+    it means something in FRONT of the WeCom API answered — an edge block on
+    可信IP, DNS, TLS, a gateway error page — rather than WeCom refusing us with
+    an errcode."""
+    resp = httpx.Response(
+        403,
+        text="<html>Forbidden</html>",
+        headers={"content-type": "text/html"},
+    )
+
+    with pytest.raises(WeComApiError) as excinfo:
+        wa._json_or_raise(resp, "gettoken")
+
+    message = str(excinfo.value)
+    assert "gettoken" in message
+    assert "403" in message
+    assert "Forbidden" in message
+    assert "text/html" in message
+
+
+def test_json_or_raise_reports_an_empty_body_explicitly():
+    """An empty body is the likeliest shape of "the request never got there",
+    and it must not be reported as an absent value."""
+    resp = httpx.Response(200, text="", headers={"content-type": "text/html"})
+
+    with pytest.raises(WeComApiError) as excinfo:
+        wa._json_or_raise(resp, "msgaudit/get_chat_data")
+
+    assert "<empty>" in str(excinfo.value)
+
+
+def test_json_or_raise_passes_a_valid_object_through():
+    resp = httpx.Response(
+        200,
+        text='{"errcode": 0, "access_token": "abc"}',
+        headers={"content-type": "application/json"},
+    )
+    assert wa._json_or_raise(resp, "gettoken")["access_token"] == "abc"

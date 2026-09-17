@@ -43,6 +43,38 @@ def _client(timeout: float = 30.0) -> httpx.Client:
     return httpx.Client(trust_env=False, timeout=timeout)
 
 
+def _json_or_raise(response: httpx.Response, label: str) -> dict[str, Any]:
+    """Parse a WeCom response, or fail with something actionable.
+
+    Calling `.json()` directly on the response produced a bare
+    `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` — which says
+    nothing about *which* call failed, what HTTP status came back, or what the
+    body actually was. A non-JSON body is precisely the case where all three
+    matter, because it means the request never reached the WeCom API and was
+    rejected by something in front of it (edge block on 可信IP, DNS, TLS, a
+    gateway error page) rather than refused by WeCom with an errcode.
+
+    Reading `response.text` first also means an empty body is reported as
+    `<empty>` instead of vanishing into the decoder.
+    """
+    body = response.text
+    snippet = body[:300].replace("\n", " ").replace("\r", " ") if body else "<empty>"
+    try:
+        data = response.json()
+    except json.JSONDecodeError as exc:
+        raise WeComApiError(
+            f"{label} returned a NON-JSON response: HTTP {response.status_code} "
+            f"{response.reason_phrase}, content-type="
+            f"{response.headers.get('content-type')!r}, body={snippet!r} ({exc})"
+        ) from exc
+    if not isinstance(data, dict):
+        raise WeComApiError(
+            f"{label} returned {type(data).__name__}, expected a JSON object: "
+            f"HTTP {response.status_code}, body={snippet!r}"
+        )
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Mock
 # ---------------------------------------------------------------------------
@@ -136,7 +168,7 @@ class RealWeComApi:
                 f"{WECOM_API_BASE}/gettoken",
                 params={"corpid": settings.corp_id, "corpsecret": secret},
             )
-            data = r.json()
+            data = _json_or_raise(r, "gettoken")
         if data.get("errcode"):
             raise WeComApiError(f"gettoken failed: {data.get('errcode')} {data.get('errmsg')}")
         self._token = data["access_token"]
@@ -154,7 +186,7 @@ class RealWeComApi:
                 params={"access_token": self.get_access_token(use_archive_secret=True)},
                 json={"seq": seq, "limit": limit, "timeout": timeout},
             )
-            payload = r.json()
+            payload = _json_or_raise(r, "msgaudit/get_chat_data")
 
         errcode = payload.get("errcode")
         if errcode:
@@ -167,7 +199,7 @@ class RealWeComApi:
                         params={"access_token": self.get_access_token(use_archive_secret=True)},
                         json={"seq": seq, "limit": limit, "timeout": timeout},
                     )
-                    payload = r.json()
+                    payload = _json_or_raise(r, "msgaudit/get_chat_data (after token refresh)")
             if payload.get("errcode"):
                 raise WeComApiError(
                     f"get_chat_data failed: {payload.get('errcode')} {payload.get('errmsg')}"
