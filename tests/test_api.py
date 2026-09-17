@@ -236,6 +236,131 @@ def test_archive_scope_reports_a_failure_instead_of_raising(client, monkeypatch)
     assert "hint" in body
 
 
+# ---------------------------------------------------------------------------
+# GET /wecom/archive/sdk — the media-path probe
+# ---------------------------------------------------------------------------
+#
+# The stages are asserted in order and individually, because the whole point of
+# the endpoint is to name WHICH stage failed. A test that only checked `ok` would
+# pass while the probe reported the wrong reason, and the wrong reason is what
+# sends the reader to fix the wrong thing.
+
+
+def _patch_sdk_path(monkeypatch, path: str) -> None:
+    import app.adapters.wework_sdk as ws
+
+    monkeypatch.setattr(ws, "resolved_sdk_path", lambda: path)
+
+
+def test_archive_sdk_is_guarded(client, monkeypatch):
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    assert client.get("/wecom/archive/sdk").status_code == 401
+
+
+def test_archive_sdk_names_pure_as_a_config_state_not_a_fault(client, monkeypatch):
+    """Under `pure` the answer is "media is impossible here", not "media is
+    broken" — those lead to different actions, and `ok: false` alone conflates
+    them."""
+    monkeypatch.setattr(settings, "decrypt_provider", "pure")
+
+    body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
+
+    assert body["ok"] is False
+    assert body["provider"] == "pure"
+    assert "WECOM_DECRYPT_PROVIDER" in body["error"]
+    assert "not a fault" in body["hint"]
+    # And it must stop here rather than reporting a missing file as the reason.
+    assert body["exists"] is False
+
+
+def test_archive_sdk_reports_a_missing_library_with_the_fix(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    _patch_sdk_path(monkeypatch, str(tmp_path / "absent.so"))
+
+    body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
+
+    assert body["ok"] is False
+    assert body["exists"] is False
+    assert body["expected_md5"], "the expected digest must be shown so it can be compared"
+    assert "fetch_sdk.sh" in body["hint"]
+
+
+def test_archive_sdk_rejects_a_file_that_is_not_the_expected_library(
+    client, monkeypatch, tmp_path
+):
+    """A wrong-but-present file must be caught by digest, not loaded."""
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    p = tmp_path / "libWeWorkFinanceSdk_C.so"
+    p.write_bytes(b"not the vendor library")
+    _patch_sdk_path(monkeypatch, str(p))
+
+    body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
+
+    assert body["ok"] is False
+    assert body["exists"] is True
+    assert body["digest_ok"] is False
+    assert body["library_loads"] is False, "an unverified library must never be dlopen'd"
+
+
+def test_archive_sdk_separates_a_load_failure_from_an_init_failure(
+    client, monkeypatch, tmp_path
+):
+    """The two stages have completely different fixes — wrong platform vs. wrong
+    credentials — so the probe has to say which one happened."""
+    from app.adapters.wework_sdk import SdkLibraryError
+
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    p = tmp_path / "libWeWorkFinanceSdk_C.so"
+    p.write_bytes(b"whatever, the digest check is stubbed")
+    _patch_sdk_path(monkeypatch, str(p))
+    monkeypatch.setattr("app.services.sdk_bootstrap.verify_sdk_file", lambda _p: (True, None))
+
+    class _Sdk:
+        def load_library(self):
+            raise SdkLibraryError("invalid ELF header")
+
+        def load(self):  # pragma: no cover - must not be reached
+            raise AssertionError("load() ran even though load_library() failed")
+
+    import app.adapters.wework_sdk as ws
+
+    monkeypatch.setattr(ws, "get_sdk", lambda: _Sdk())
+
+    body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
+
+    assert body["ok"] is False
+    assert body["digest_ok"] is True
+    assert body["library_loads"] is False
+    assert "invalid ELF header" in body["error"]
+    assert "Linux x86-64" in body["hint"]
+
+
+def test_archive_sdk_reports_a_successful_init(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    p = tmp_path / "libWeWorkFinanceSdk_C.so"
+    p.write_bytes(b"stub")
+    _patch_sdk_path(monkeypatch, str(p))
+    monkeypatch.setattr("app.services.sdk_bootstrap.verify_sdk_file", lambda _p: (True, None))
+
+    class _Sdk:
+        def load_library(self):
+            return object()
+
+        def load(self):
+            return object()
+
+    import app.adapters.wework_sdk as ws
+
+    monkeypatch.setattr(ws, "get_sdk", lambda: _Sdk())
+
+    body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
+
+    assert body["ok"] is True
+    assert body["library_loads"] is True
+    assert body["init_ok"] is True
+    assert body["error"] is None
+
+
 def test_messages_list_uses_the_pagination_contract(client, db):
     db.add(WeComMessageLog(msgid="wm1", msgtype="text", status="received"))
     db.commit()

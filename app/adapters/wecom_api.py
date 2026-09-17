@@ -288,36 +288,29 @@ class RealWeComApi:
     # --- media -------------------------------------------------------------
 
     def download_media(self, sdkfileid: str, filename: str | None = None) -> tuple[bytes, str | None]:
-        """Fetch an archived attachment.
+        """Fetch a COMPLETE archived attachment via the official finance SDK.
 
-        Session-archive media is only retrievable through the official finance
-        SDK (GetMediaData). When WECOM_DECRYPT_PROVIDER=sdk we call it; otherwise
-        we attempt the `sdkfileid`-based HTTP route and raise a clear error if
-        WeCom refuses, so the gap is obvious rather than silent.
+        There is no HTTP route for this. The SDK's `GetMediaData` is the only
+        way, and it hands back ~512 KB at a time — so the chunk loop in
+        `wework_sdk.download_media` matters more than it looks. Fetching only the
+        first chunk returns successfully and produces a file silently truncated
+        at 512 KB, which fails later inside the ERP as a parse error pointing at
+        entirely the wrong place.
         """
-        if (settings.decrypt_provider or "pure").strip().lower() == "sdk":
-            from app.adapters.decrypt import SdkDecryptor
+        if (settings.decrypt_provider or "pure").strip().lower() != "sdk":
+            raise WeComApiError(
+                "Live archive media download requires the official WeCom finance "
+                "SDK. Set WECOM_DECRYPT_PROVIDER=sdk and WECOM_ARCHIVE_SDK_PATH "
+                "(and WECOM_ARCHIVE_SDK_AUTOFETCH=true to have the gateway fetch "
+                "the library itself)."
+            )
 
-            dec = SdkDecryptor()
-            lib = dec._load()
-            ctypes = dec._ctypes
-            media = lib.NewMediaData()
-            try:
-                rc = lib.GetMediaData(dec._sdk, b"", sdkfileid.encode(), b"", b"", 60, media)
-                if rc != 0:
-                    raise WeComApiError(f"SDK GetMediaData failed with code {rc}")
-                buf = ctypes.string_at(lib.GetData(media), lib.GetDataLen(media))
-                return bytes(buf), filename
-            finally:
-                try:
-                    lib.FreeMediaData(media)
-                except Exception:  # noqa: BLE001
-                    pass
+        from app.adapters.wework_sdk import SdkLibraryError, get_sdk
 
-        raise WeComApiError(
-            "Live archive media download requires the official WeCom finance SDK "
-            "(set WECOM_DECRYPT_PROVIDER=sdk and WECOM_ARCHIVE_SDK_PATH)."
-        )
+        try:
+            return get_sdk().download_media(sdkfileid), filename
+        except SdkLibraryError as exc:
+            raise WeComApiError(f"archive media download failed: {exc}") from exc
 
     # --- outbound ----------------------------------------------------------
 

@@ -119,88 +119,28 @@ class PureCryptoDecryptor:
 
 
 class SdkDecryptor:
-    """ctypes binding to WeCom's WeWorkFinanceSdk.
+    """Decryption through WeCom's official finance SDK.
 
-    Expected exports on the shared library:
-        NewSdk(), Init(sdk, corpid, secret), NewSlice(),
-        GetChatData(sdk, seq, limit, proxy, passwd, timeout, slice),
-        DecryptData(sdk, encrypt_key, encrypt_msg, slice),
-        GetContentFromSlice(slice), FreeSlice(slice), DestroySdk(sdk)
+    The ctypes binding itself lives in `app/adapters/wework_sdk.py`, which
+    documents the two signatures that are easy to get wrong. This class is only
+    the adapter behind the `Decryptor` protocol — it holds no library state, so
+    the handle stays shared and `Init()` is paid once per process rather than
+    once per message.
     """
 
     def __init__(self, sdk_path: str | None = None) -> None:
         self.sdk_path = sdk_path or settings.archive_sdk_path
-        self._lib = None
-        self._sdk = None
-
-    def _load(self):
-        if self._lib is not None:
-            return self._lib
-        import ctypes
-        from ctypes import c_char_p, c_int, c_longlong, c_void_p
-
-        path = (self.sdk_path or "").strip()
-        if not path:
-            raise DecryptError(
-                "WECOM_ARCHIVE_SDK_PATH is not set — provide the WeWorkFinanceSdk "
-                "shared library, or set WECOM_DECRYPT_PROVIDER=pure"
-            )
-        if not Path(path).exists():
-            raise DecryptError(f"WeCom finance SDK not found: {path}")
-
-        lib = ctypes.CDLL(path)
-        lib.NewSdk.restype = c_void_p
-        lib.Init.argtypes = [c_void_p, c_char_p, c_char_p]
-        lib.Init.restype = c_int
-        lib.NewSlice.restype = c_void_p
-        lib.GetContentFromSlice.argtypes = [c_void_p]
-        lib.GetContentFromSlice.restype = c_char_p
-        lib.DecryptData.argtypes = [c_void_p, c_char_p, c_char_p, c_void_p]
-        lib.DecryptData.restype = c_int
-        lib.FreeSlice.argtypes = [c_void_p]
-
-        self._ctypes = ctypes
-        self._lib = lib
-
-        if not (settings.corp_id and (settings.archive_secret or settings.secret)):
-            raise DecryptError(
-                "WECOM_CORP_ID and (WECOM_ARCHIVE_SECRET or WECOM_SECRET) are required for the SDK path"
-            )
-
-        # The SDK Init() secret is the 会话内容存档 secret, not the app secret.
-        sdk_secret = (settings.archive_secret or settings.secret)
-        sdk = lib.NewSdk()
-        rc = lib.Init(sdk, settings.corp_id.encode(), sdk_secret.encode())
-        if rc != 0:
-            raise DecryptError(f"WeCom SDK Init failed with code {rc}")
-        self._sdk = sdk
-        return lib
 
     def decrypt(self, encrypt_random_key: str, encrypt_chat_msg: str) -> str:
-        lib = self._load()
-        ctypes = self._ctypes
-        lib.GetChatData.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_uint,
-            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p,
-        ]
+        from app.adapters.wework_sdk import SdkLibraryError, get_sdk
 
-        slice_ptr = lib.NewSlice()
+        sdk = get_sdk()
+        if self.sdk_path:
+            sdk.path = self.sdk_path
         try:
-            rc = lib.DecryptData(
-                self._sdk,
-                (encrypt_random_key or "").encode(),
-                (encrypt_chat_msg or "").encode(),
-                slice_ptr,
-            )
-            if rc != 0:
-                raise DecryptError(f"WeCom SDK DecryptData failed with code {rc}")
-            raw = lib.GetContentFromSlice(slice_ptr)
-            return (raw or b"").decode("utf-8", errors="replace")
-        finally:
-            try:
-                lib.FreeSlice(slice_ptr)
-            except Exception:  # noqa: BLE001 - best effort cleanup
-                pass
+            return sdk.decrypt(encrypt_random_key, encrypt_chat_msg)
+        except SdkLibraryError as exc:
+            raise DecryptError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

@@ -76,7 +76,25 @@ async def lifespan(_: FastAPI):
     except Exception:  # noqa: BLE001 - a key problem must not kill the gateway
         logger.exception("startup: archive private-key bootstrap failed")
 
-    if settings.archive_private_key_path or settings.archive_sdk_path:
+    # The SDK is needed only for ATTACHMENTS, and it is a 6.4 MB download — so it
+    # runs on a daemon thread. Doing it inline risks the platform healthcheck
+    # timing out on a slow CDN and the container being restarted in a loop, and
+    # nothing needs the library until the first attachment arrives.
+    try:
+        from app.services.sdk_bootstrap import start_sdk_bootstrap
+
+        start_sdk_bootstrap()
+    except Exception:  # noqa: BLE001
+        logger.exception("startup: SDK bootstrap failed to start")
+
+    # NOTE: the poller guard must use `resolved_sdk_path()`, not
+    # `settings.archive_sdk_path`. With autofetch the setting is deliberately
+    # EMPTY and the library appears at the default location, so guarding on the
+    # raw setting would leave the poller stopped on a correctly configured
+    # `sdk` deploy — the silent failure this whole path exists to avoid.
+    from app.adapters.wework_sdk import resolved_sdk_path
+
+    if settings.archive_private_key_path or resolved_sdk_path():
         try:
             from app.services.archive import start_poller
 

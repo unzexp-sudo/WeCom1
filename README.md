@@ -268,8 +268,9 @@ environment variables or a `.env` file — **never commit real values**.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `WECOM_ARCHIVE_PRIVATE_KEY_PATH` | `""` | path to the RSA-2048 **private** key PEM whose public half you uploaded to WeCom. **PATH ONLY — never put the key material in an env var.** |
-| `WECOM_ARCHIVE_SDK_PATH` | `""` | path to the official `WeWorkFinanceSdk` `.so`/`.dll` if you use `WECOM_DECRYPT_PROVIDER=sdk` |
-| `WECOM_DECRYPT_PROVIDER` | `pure` | `pure` = pure-Python RSA+AES via `cryptography`; `sdk` = official C SDK via ctypes |
+| `WECOM_ARCHIVE_SDK_PATH` | `""` | path to the official `WeWorkFinanceSdk` `.so`. **Leave empty** to use the location the gateway fetches into (`vendor/`) — the container is ephemeral, so an operator cannot know this path in advance. |
+| `WECOM_ARCHIVE_SDK_AUTOFETCH` | `true` | fetch the official SDK at boot into `vendor/libWeWorkFinanceSdk_C.so` when `WECOM_ARCHIVE_SDK_PATH` is empty. Only runs under `WECOM_DECRYPT_PROVIDER=sdk` |
+| `WECOM_DECRYPT_PROVIDER` | `pure` | `pure` = pure-Python RSA+AES via `cryptography` (text only); `sdk` = official C SDK via ctypes (**required for attachments**) |
 | `WECOM_ARCHIVE_PULL_INTERVAL` | `30` | seconds between archive polls |
 | `WECOM_ARCHIVE_LIMIT` | `1000` | max entries per pull |
 | `WECOM_ARCHIVE_TIMEOUT` | `5` | seconds per pull HTTP call |
@@ -398,8 +399,16 @@ Nothing below has been done or verified. Work through it in order.
 - [ ] Configure the **callback URL** (`https://<host>/wecom/callback`) and let WeCom
       generate a **Token** and a 43-character **EncodingAESKey**.
 - [ ] Whitelist the gateway's egress IP in the WeCom app's **可信IP** list.
-- [ ] Add the archive **SDK library** to the host if you choose
-      `WECOM_DECRYPT_PROVIDER=sdk`; `pure` needs only `cryptography`.
+- [ ] Whitelist the same IP in the **Session Archive** page's own **可信IP** list.
+      It is a **separate** list from the app's, and a missing entry here returns
+      `errcode 60020` / SDK `10009` on every pull. Confirm the address with
+      `GET /wecom/archive/egress-ip`.
+- [ ] Add the archive **SDK library** if you need **attachments** (`image`, `file`,
+      `voice`, `mixed`). Text never needs it. Leave `WECOM_ARCHIVE_SDK_PATH` empty
+      with `WECOM_ARCHIVE_SDK_AUTOFETCH=true` and the gateway fetches the official
+      library itself at boot; or run `bash scripts/fetch_sdk.sh` and point the
+      setting at the result. Verify with `GET /wecom/archive/sdk` — it names the
+      stage that failed rather than just reporting "not ready".
 
 **Server / environment**
 

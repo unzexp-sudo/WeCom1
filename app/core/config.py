@@ -67,7 +67,16 @@ class Settings(BaseSettings):
     # `archive_private_key_path` on a host where you can place the file directly;
     # this exists so a Railway/Heroku-style deploy has *some* way to work.
     archive_private_key_b64: str = ""
+    # Path to `libWeWorkFinanceSdk_C.so`. Leave EMPTY to let the gateway fetch the
+    # official library itself into `vendor/` at boot (see
+    # `services/sdk_bootstrap.py`) — which is the only practical option on a
+    # container, where the filesystem is ephemeral and there is no shell. Set it
+    # explicitly when you ship the library yourself (e.g. baked into an image).
     archive_sdk_path: str = ""
+    # Fetch the SDK at boot when `archive_sdk_path` is unset or the file is
+    # missing. Pinned to a vendor URL and verified by md5, so this is a supply
+    # of a known artefact rather than a live dependency on the network.
+    archive_sdk_autofetch: bool = True
     # "pure" = pure-Python RSA/AES via `cryptography`; "sdk" = official C SDK
     decrypt_provider: str = "pure"
 

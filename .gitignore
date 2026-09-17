@@ -16,9 +16,11 @@ data/
 .DS_Store
 
 # WeCom finance SDK binary + Session-Archive RSA private key — never commit.
-# The .so is fetched at build from WeCom's CDN; the key is mounted from a
-# Railway Volume at runtime. If you drop them locally for testing, keep them out
-# of git.
+# The .so is fetched at boot from WeCom's CDN (see services/sdk_bootstrap.py);
+# the key is supplied via WECOM_ARCHIVE_PRIVATE_KEY_B64 or mounted at runtime.
+# If you drop them locally for testing, keep them out of git.
+vendor/
 libWeWorkFinanceSdk.so
+libWeWorkFinanceSdk_C.so
 archive_private_key.pem
 *.pem
