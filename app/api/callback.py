@@ -521,9 +521,11 @@ def archive_consent(roomid: str | None = Query(default=None)) -> dict:
     **Getting a room id is the hard part.** The archive cannot enumerate rooms, so
     on a silent pipeline there is nothing to pass in. When `roomid` is omitted
     this endpoint tries to recover one from the 客户群 list
-    (`externalcontact/groupchat/list`, APP secret, needs the 客户联系 permission)
-    and falls back to reporting that failure — errcode 60011 there means the app
-    lacks 客户联系, which is a console fix, not a bug.
+    (`externalcontact/groupchat/list`, APP secret) — that listing uses the
+    customer-contact APP, so it only works if you actually use that app; for an
+    archiving-only setup just pass `?roomid=<chatid>` from the WeCom console. If
+    the listing fails it falls back to reporting that failure — errcode 60011
+    there means the app lacks 客户联系, which is a console fix, not a bug.
 
     `status` values are returned RAW and only counted, never mapped: the vendor
     page for this API does not print the enum in the section that is retrievable
@@ -569,18 +571,18 @@ def archive_consent(roomid: str | None = Query(default=None)) -> dict:
             )
             if code == 60020:
                 out["hint"] = (
-                    "The APP secret is rejected from this service's address. "
-                    "errcode 60020 is 'not allow to access from your ip', and the "
-                    "address to whitelist is the `from ip:` shown in the error "
-                    "above. This is a SEPARATE list from the archive's — the "
-                    "archive secret already works from the very same address, "
-                    "which is exactly why every archive probe passes while this "
-                    "one fails. Add the address to the self-built app's Trusted "
-                    "IP list on the APP's own page, not on the Message Archiving "
-                    "page. This also matters beyond this probe: outbound "
-                    "POST /wecom/send uses the same app secret from the same "
-                    "address, so it will fail the same way until this is fixed."
-                    + tail
+                    "This 60020 is from the OPTIONAL customer-group auto-discovery, "
+                    "which uses the customer-contact APP secret — NOT the archiving "
+                    "service. If you are using the archive service only (no "
+                    "customer-contact app), you can ignore this: just pass the room "
+                    "id directly via ?roomid=<chatid> (find the chatid in the WeCom "
+                    "console under the customer group). The archive's own consent "
+                    "check (check_room_agree) uses the archive secret and already "
+                    "works from this address. Only if you actually USE the "
+                    "customer-contact app do you need to whitelist the `from ip:` "
+                    "above on the app's OWN Trusted IP page — which is separate from "
+                    "the Message Archiving page — and the same 60020 also blocks "
+                    "outbound POST /wecom/send (customer notifications)." + tail
                 )
             elif code == 60011:
                 out["hint"] = (
