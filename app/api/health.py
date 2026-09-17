@@ -67,6 +67,23 @@ def _config_readiness() -> dict:
     media_base = (settings.media_url_base or "").strip()
     key_path = (settings.archive_private_key_path or "").strip()
 
+    # The SDK path is reported as the path actually IN EFFECT, not the raw
+    # setting. Those differ on purpose: with autofetch the setting is left empty
+    # and the library is fetched into a default location, so reporting the raw
+    # setting made a correctly configured `sdk` deploy read as
+    # `archive_sdk_path_set: false` — i.e. it looked like the operator had
+    # forgotten a step they had been told to skip. Same trap as the poller guard
+    # in main.py, which has to use `resolved_sdk_path()` for the same reason.
+    from app.adapters.wework_sdk import resolved_sdk_path
+
+    sdk_path = resolved_sdk_path()
+    if (settings.archive_sdk_path or "").strip():
+        sdk_path_source = "explicit"
+    elif sdk_path:
+        sdk_path_source = "autofetch"
+    else:
+        sdk_path_source = "none"
+
     warnings: list[str] = []
 
     if not staff:
@@ -137,6 +154,18 @@ def _config_readiness() -> dict:
             "provider to 'sdk' before real orders, which are attachments, start "
             "arriving."
         )
+    elif not os.path.exists(sdk_path or ""):
+        # The provider is right but the library is not on disk. The boot
+        # bootstrap may still be downloading, or it failed — either way media
+        # cannot work yet, and the only other place that says so is the staged
+        # probe, which an operator has to know to call.
+        warnings.append(
+            f"WECOM_DECRYPT_PROVIDER is 'sdk' but the library is not present at "
+            f"{sdk_path!r} ({sdk_path_source}). The boot bootstrap may still be "
+            "downloading, or it failed — check GET /wecom/archive/sdk, which "
+            "names the stage that failed. Until then every attachment fails to "
+            "download and holds the archive cursor."
+        )
     if key_path and not os.path.exists(key_path):
         warnings.append(
             f"WECOM_ARCHIVE_PRIVATE_KEY_PATH is set but {key_path} does not "
@@ -173,7 +202,15 @@ def _config_readiness() -> dict:
             (settings.archive_private_key_b64 or "").strip()
         ),
         "decrypt_provider": settings.decrypt_provider,
-        "archive_sdk_path_set": bool((settings.archive_sdk_path or "").strip()),
+        # The path in effect, plus where it came from and whether the file is
+        # actually there. `archive_sdk_path_set` keeps its name so existing
+        # readers still work, but it now means "a path is in effect" rather than
+        # "the setting is non-empty" — the two differ under autofetch, which is
+        # the default and the recommended configuration.
+        "archive_sdk_path": sdk_path or None,
+        "archive_sdk_path_source": sdk_path_source,
+        "archive_sdk_path_set": bool(sdk_path),
+        "archive_sdk_present": bool(sdk_path) and os.path.exists(sdk_path),
         "corp_id_set": bool((settings.corp_id or "").strip()),
         "warnings": warnings,
     }

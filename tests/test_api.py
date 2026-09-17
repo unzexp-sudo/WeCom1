@@ -88,17 +88,84 @@ def test_health_warns_that_pure_cannot_download_attachments(client, monkeypatch)
         "the warning must tell the operator how to clear the held cursor"
     )
     assert not any("unable to clear" in w for w in warnings)
-    assert body["config"]["archive_sdk_path_set"] is False
+    # Under `pure` the SDK is irrelevant, but a path is still *in effect* —
+    # autofetch would write there if the provider changed. Reporting the raw
+    # setting here made a correctly configured `sdk` deploy read as
+    # `archive_sdk_path_set: false`, so the field now reports the effective path
+    # and a separate key says where it came from.
+    assert body["config"]["archive_sdk_path_source"] == "autofetch"
+    assert body["config"]["archive_sdk_present"] is False
 
 
-def test_health_does_not_warn_about_media_under_the_sdk_provider(client, monkeypatch):
+def test_health_reports_the_effective_sdk_path_not_the_raw_setting(
+    client, monkeypatch, tmp_path
+):
+    """The trap this guards: an operator follows the instructions — set
+    `WECOM_DECRYPT_PROVIDER=sdk`, leave the path empty so the gateway fetches the
+    library itself — and health then reports `archive_sdk_path_set: false`, which
+    reads as "you forgot a step". The step was deliberately skipped."""
+    from app.adapters import wework_sdk as ws
+
     monkeypatch.setattr(settings, "decrypt_provider", "sdk")
-    monkeypatch.setattr(settings, "archive_sdk_path", "/app/lib/libWeWorkFinanceSdk_C.so")
+    monkeypatch.setattr(settings, "archive_sdk_path", "")  # autofetch
+    monkeypatch.setattr(settings, "archive_sdk_autofetch", True)
+
+    cfg = client.get("/wecom/health").json()["config"]
+
+    assert cfg["archive_sdk_path_source"] == "autofetch"
+    assert cfg["archive_sdk_path_set"] is True, "the effective path is not reported"
+    assert cfg["archive_sdk_path"] == str(ws.DEFAULT_SDK_DIR / ws.SDK_FILENAME)
+    assert cfg["archive_sdk_present"] is False, "the file is not on disk yet"
+
+
+def test_health_reports_a_present_library(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    lib = tmp_path / "libWeWorkFinanceSdk_C.so"
+    lib.write_bytes(b"stub")
+    monkeypatch.setattr(settings, "archive_sdk_path", str(lib))
+
+    cfg = client.get("/wecom/health").json()["config"]
+
+    assert cfg["archive_sdk_path_source"] == "explicit"
+    assert cfg["archive_sdk_present"] is True
+    assert not any("library is not present" in w for w in cfg["warnings"])
+
+
+def test_health_warns_when_the_provider_is_sdk_but_the_library_is_absent(
+    client, monkeypatch, tmp_path
+):
+    """The provider is right but the file is not there — the boot fetch may still
+    be running, or it failed. Without this the only signal is the staged probe,
+    which an operator has to know to call."""
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    monkeypatch.setattr(settings, "archive_sdk_path", str(tmp_path / "absent.so"))
+
+    cfg = client.get("/wecom/health").json()["config"]
+
+    assert cfg["archive_sdk_present"] is False
+    assert any("library is not present" in w for w in cfg["warnings"])
+    assert any("/wecom/archive/sdk" in w for w in cfg["warnings"])
+
+
+def test_health_does_not_warn_about_media_under_the_sdk_provider(
+    client, monkeypatch, tmp_path
+):
+    """The fully-configured case must be silent about media.
+
+    Pointed at a file that actually exists, so this asserts "nothing to say"
+    rather than "one of the two media warnings is absent".
+    """
+    lib = tmp_path / "libWeWorkFinanceSdk_C.so"
+    lib.write_bytes(b"stub")
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    monkeypatch.setattr(settings, "archive_sdk_path", str(lib))
 
     body = client.get("/wecom/health").json()
     warnings = body["config"]["warnings"]
     assert not any("ATTACHMENTS" in w for w in warnings)
+    assert not any("library is not present" in w for w in warnings)
     assert body["config"]["archive_sdk_path_set"] is True
+    assert body["config"]["archive_sdk_present"] is True
 
 
 def test_archive_egress_ip_is_guarded_and_reports_the_ip(client, monkeypatch):
