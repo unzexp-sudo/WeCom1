@@ -305,3 +305,41 @@ def test_json_or_raise_passes_a_valid_object_through():
         headers={"content-type": "application/json"},
     )
     assert wa._json_or_raise(resp, "gettoken")["access_token"] == "abc"
+
+
+def test_get_chat_data_posts_to_the_path_the_sdk_actually_calls(monkeypatch):
+    """Regression guard for the bug that blocked the first live pull.
+
+    `/cgi-bin/msgaudit/get_chat_data` returns HTTP 404 with an empty body — yet
+    sibling paths under `/msgaudit/` (groupchat/get, check_single_agree) return
+    proper JSON errors, so the namespace looks correct and the 404 reads like a
+    permissions problem instead of a wrong URL. The path the official finance
+    SDK actually requests, read out of libWeWorkFinanceSdk_C.so, is
+    `/cgi-bin/message/getchatdata`.
+    """
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = '{"errcode":0,"chatdata":[]}'
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+    monkeypatch.setattr("app.adapters.decrypt.get_decryptor", lambda: object())
+
+    wa.RealWeComApi().get_chat_data(seq=0, limit=1, timeout=5)
+
+    pull_urls = [u for u in urls if "gettoken" not in u]
+    assert pull_urls, "no archive pull request was made"
+    assert "/cgi-bin/message/getchatdata" in pull_urls[0]
+    assert "msgaudit" not in pull_urls[0]

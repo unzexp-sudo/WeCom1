@@ -18,6 +18,24 @@ from app.core.config import settings
 logger = logging.getLogger("wecom.api")
 
 WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
+
+# The session-archive pull path. It is NOT `/msgaudit/get_chat_data` — every
+# spelling under `/msgaudit/` returns HTTP 404 with an empty body, which is what
+# the first live pull hit.
+#
+# The real path was read out of the official finance SDK binary itself
+# (`libWeWorkFinanceSdk_C.so`, version 20250205): the SDK's own request strings
+# are `/cgi-bin/message/getchatdata?access_token=` and
+# `/cgi-bin/message/getchatmediadata?access_token=`. Confirmed against the live
+# API: `/cgi-bin/message/getchatdata` answers HTTP 200 with
+# `{"errcode":40014,"errmsg":"invalid access_token","chatdata":[]}` for a bad
+# token, while `/cgi-bin/msgaudit/get_chat_data` answers 404 with 0 bytes.
+#
+# Sibling paths under `/msgaudit/` (`groupchat/get`, `check_single_agree`) DO
+# exist, which is what makes the wrong spelling so easy to miss: the namespace
+# looks right, so the 404 reads like a permissions problem rather than a typo.
+ARCHIVE_PULL_PATH = "/message/getchatdata"
+ARCHIVE_MEDIA_PATH = "/message/getchatmediadata"
 TOKEN_TTL_SECONDS = 7000
 
 
@@ -182,11 +200,11 @@ class RealWeComApi:
 
         with _client() as c:
             r = c.post(
-                f"{WECOM_API_BASE}/msgaudit/get_chat_data",
+                f"{WECOM_API_BASE}{ARCHIVE_PULL_PATH}",
                 params={"access_token": self.get_access_token(use_archive_secret=True)},
                 json={"seq": seq, "limit": limit, "timeout": timeout},
             )
-            payload = _json_or_raise(r, "msgaudit/get_chat_data")
+            payload = _json_or_raise(r, "message/getchatdata")
 
         errcode = payload.get("errcode")
         if errcode:
@@ -195,11 +213,11 @@ class RealWeComApi:
                 self.get_access_token(force=True, use_archive_secret=True)
                 with _client() as c:
                     r = c.post(
-                        f"{WECOM_API_BASE}/msgaudit/get_chat_data",
+                        f"{WECOM_API_BASE}{ARCHIVE_PULL_PATH}",
                         params={"access_token": self.get_access_token(use_archive_secret=True)},
                         json={"seq": seq, "limit": limit, "timeout": timeout},
                     )
-                    payload = _json_or_raise(r, "msgaudit/get_chat_data (after token refresh)")
+                    payload = _json_or_raise(r, "message/getchatdata (after token refresh)")
             if payload.get("errcode"):
                 raise WeComApiError(
                     f"get_chat_data failed: {payload.get('errcode')} {payload.get('errmsg')}"
