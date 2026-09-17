@@ -311,6 +311,190 @@ def test_archive_scope_reports_a_failure_instead_of_raising(client, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# GET /wecom/archive/consent — the external-contact consent probe
+# ---------------------------------------------------------------------------
+
+
+class _FakeConsentApi:
+    """Stands in for the WeCom client at the `/wecom/archive/consent` boundary.
+
+    `agreeinfo` entries are keyed by roomid so a single fake can model one room
+    that consented and another that did not — the case that matters, because a
+    partially-consented customer base is what makes an empty pull so confusing.
+    """
+
+    def __init__(self, groups=None, agree=None, list_error=None, agree_error=None) -> None:
+        self._groups = groups if groups is not None else []
+        self._agree = agree if agree is not None else {}
+        self._list_error = list_error
+        self._agree_error = agree_error
+        self.listed_owner = None
+
+    def list_customer_groups(self, owner=None):
+        self.listed_owner = owner
+        if self._list_error is not None:
+            raise self._list_error
+        return list(self._groups)
+
+    def check_room_agree(self, roomid):
+        if self._agree_error is not None:
+            raise self._agree_error
+        return list(self._agree.get(roomid, []))
+
+
+def _patch_consent_api(monkeypatch, api) -> None:
+    import app.adapters.wecom_api as wa
+
+    monkeypatch.setattr(wa, "get_wecom_api", lambda: api)
+
+
+def test_archive_consent_is_guarded(client, monkeypatch):
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    assert client.get("/wecom/archive/consent").status_code == 401
+
+
+def test_archive_consent_flags_an_external_contact_who_has_not_consented(
+    client, monkeypatch
+):
+    """The whole point: a customer who sent a real order and is still unarchived.
+
+    Lulu sent a text order, it is visible in the group, and the pull is empty.
+    Before this probe the only answers were "the scope is wrong" (it is not) or
+    "nothing was sent" (it was). Consent is the third answer, and it is the one
+    the docs state outright.
+    """
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "captainape")
+    _patch_consent_api(
+        monkeypatch,
+        _FakeConsentApi(
+            groups=[{"chat_id": "wrGROUP1"}],
+            agree={"wrGROUP1": [{"userid": "wmLULU", "status": 0}]},
+        ),
+    )
+
+    res = client.get("/wecom/archive/consent", headers={"X-Gateway-Key": "test-key"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["roomids"] == ["wrGROUP1"]
+    assert body["consent"][0]["agreeinfo"] == [{"userid": "wmLULU", "status": 0}]
+    assert body["consent"][0]["status_counts"] == {"0": 1}
+    # The raw status must survive; the endpoint does not map it to a word.
+    assert "not in the consented state" in body["hint"]
+
+
+def test_archive_consent_clears_consent_and_moves_to_the_public_key(
+    client, monkeypatch
+):
+    """A consented customer must NOT leave the reader blaming consent.
+
+    Otherwise the probe becomes the next dead end: it would report the same
+    "check consent" line whether or not consent is the problem.
+    """
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "captainape")
+    _patch_consent_api(
+        monkeypatch,
+        _FakeConsentApi(
+            groups=[{"chat_id": "wrGROUP1"}],
+            agree={"wrGROUP1": [{"userid": "wmLULU", "status": 1}]},
+        ),
+    )
+
+    body = client.get(
+        "/wecom/archive/consent", headers={"X-Gateway-Key": "test-key"}
+    ).json()
+    assert body["consent"][0]["status_counts"] == {"1": 1}
+    assert "consent is NOT the reason" in body["hint"]
+    assert "public key" in body["hint"].lower()
+
+
+def test_archive_consent_reports_a_missing_external_contact_permission(
+    client, monkeypatch
+):
+    """errcode 60011 is a console fix, so it must be named as one."""
+    from app.adapters.wecom_api import WeComApiError
+
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "captainape")
+    _patch_consent_api(
+        monkeypatch,
+        _FakeConsentApi(
+            list_error=WeComApiError("groupchat/list failed: 60011 no privilege")
+        ),
+    )
+
+    res = client.get("/wecom/archive/consent", headers={"X-Gateway-Key": "test-key"})
+    assert res.status_code == 200  # never 500 — this is a diagnostic
+    body = res.json()
+    assert body["ok"] is False
+    assert "60011" in body["discovery_error"]
+    assert "客户联系" in body["hint"]
+
+
+def test_archive_consent_uses_an_explicit_roomid_without_discovery(
+    client, monkeypatch
+):
+    """With a roomid in hand there is no reason to need 客户联系 at all."""
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    api = _FakeConsentApi(
+        groups=[{"chat_id": "wrSHOULD_NOT_BE_LISTED"}],
+        agree={"wrDIRECT": [{"userid": "wmLULU", "status": 1}]},
+    )
+    _patch_consent_api(monkeypatch, api)
+
+    body = client.get(
+        "/wecom/archive/consent?roomid=wrDIRECT", headers={"X-Gateway-Key": "test-key"}
+    ).json()
+    assert body["roomid_source"] == "explicit"
+    assert body["roomids"] == ["wrDIRECT"]
+    assert api.listed_owner is None  # discovery was skipped entirely
+
+
+def test_archive_consent_keeps_going_when_one_room_fails(client, monkeypatch):
+    """One unreadable room must not hide the consent state of the others."""
+    from app.adapters.wecom_api import WeComApiError
+
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "captainape")
+
+    class _OneRoomFails(_FakeConsentApi):
+        def check_room_agree(self, roomid):
+            if roomid == "wrBAD":
+                raise WeComApiError("check_room_agree failed: 60020 ip not allowed")
+            return [{"userid": "wmLULU", "status": 1}]
+
+    _patch_consent_api(
+        monkeypatch,
+        _OneRoomFails(groups=[{"chat_id": "wrBAD"}, {"chat_id": "wrGOOD"}]),
+    )
+
+    res = client.get("/wecom/archive/consent", headers={"X-Gateway-Key": "test-key"})
+    assert res.status_code == 200
+    body = res.json()
+    assert [r["roomid"] for r in body["consent"]] == ["wrBAD", "wrGOOD"]
+    assert "60020" in body["consent"][0]["error"]
+    assert body["consent"][1]["status_counts"] == {"1": 1}
+    # The good room's consent still clears consent as the cause.
+    assert "consent is NOT the reason" in body["hint"]
+
+
+def test_archive_consent_explains_when_there_are_no_customer_groups(
+    client, monkeypatch
+):
+    """No 客户群 means the group is not archivable as an external session."""
+    monkeypatch.setattr(settings, "gateway_service_key", "test-key")
+    monkeypatch.setattr(settings, "staff_userids", "captainape")
+    _patch_consent_api(monkeypatch, _FakeConsentApi(groups=[]))
+
+    body = client.get(
+        "/wecom/archive/consent", headers={"X-Gateway-Key": "test-key"}
+    ).json()
+    assert body["ok"] is False
+    assert "not a 客户群" in body["hint"]
+
+
+# ---------------------------------------------------------------------------
 # GET /wecom/archive/sdk — the media-path probe
 # ---------------------------------------------------------------------------
 #

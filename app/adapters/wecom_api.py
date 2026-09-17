@@ -50,6 +50,38 @@ ARCHIVE_MEDIA_PATH = "/message/getchatmediadata"
 # Unlike the pull, this one really does live under `/msgaudit/` — the namespace is
 # genuine, which is exactly what made the pull path so easy to get wrong.
 ARCHIVE_PERMIT_LIST_PATH = "/msgaudit/get_permit_user_list"
+
+# Consent. This is the gate that makes an EMPTY PULL look identical to "nobody
+# has talked yet", and it is the one the docs state explicitly (doc `path/91361`,
+# 使用前帮助):
+#
+#   *"员工与外部联系人的会话内容，经外部联系人同意后，企业可通过API获取。"*
+#
+# An external contact's messages are NOT archived until that contact has
+# consented — so a customer can send an order, see it land in the group, and
+# still produce `fetched: 0`. `check_room_agree` is the only way to tell that
+# apart from "nothing was sent": it returns the consent state of every external
+# member of a group, keyed by the room id, using the same archive secret as the
+# pull. `check_single_agree` does the same for one (member, external) pair.
+#
+# Both take the 会话内容存档 secret's token — the self-built-app token is rejected.
+ARCHIVE_CHECK_ROOM_AGREE_PATH = "/msgaudit/check_room_agree"
+ARCHIVE_CHECK_SINGLE_AGREE_PATH = "/msgaudit/check_single_agree"
+
+# The archive's own view of a group (doc `path/92951`, 获取会话内容存档内部群信息).
+# Takes a roomid and returns its members, which is how a room id recovered from a
+# message can be turned back into "which group is this?".
+ARCHIVE_GROUP_INFO_PATH = "/msgaudit/groupchat/get"
+
+# The 客户群 (customer group) list, used only to RECOVER a room id. The archive
+# gives no way to enumerate rooms, so on a silent pipeline the room id has to
+# come from the external-contact side of the API. This is an APP-secret call and
+# needs the 客户联系 permission, so it is expected to fail with errcode 60011 on
+# an app that only has the archive permission — that failure is itself the answer
+# ("grant 客户联系, or find the room id another way"), not a bug.
+EXTERNAL_GROUP_LIST_PATH = "/externalcontact/groupchat/list"
+EXTERNAL_GROUP_GET_PATH = "/externalcontact/groupchat/get"
+
 TOKEN_TTL_SECONDS = 7000
 
 
@@ -159,6 +191,33 @@ class MockWeComApi:
         ignore the field.
         """
         return settings.staff_list()
+
+    # --- consent (mock) ----------------------------------------------------
+
+    def check_room_agree(self, roomid: str) -> list[dict[str, Any]]:
+        """Mock: one external member who HAS consented.
+
+        Consent is the gate that silently eats real orders, so the mock reports
+        the healthy case. A test that needs the failing case should patch this
+        rather than inherit it — a mock that defaults to "nobody consented" would
+        make every other test look like a consent bug.
+        """
+        return [{"userid": "mock-external", "status": 1, "agree_time": 1700000000000}]
+
+    def check_single_agree(self, userid: str, external_openid: str) -> list[dict[str, Any]]:
+        return [{"userid": userid, "exteranalopenid": external_openid, "status": 1}]
+
+    def get_archive_group(self, roomid: str) -> dict[str, Any]:
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "roomid": roomid,
+            "members": [{"userid": u, "type": 1} for u in settings.staff_list()],
+        }
+
+    def list_customer_groups(self, owner: str | None = None) -> list[dict[str, Any]]:
+        """Mock: no customer groups. The real call needs 客户联系 permission."""
+        return []
 
     def download_media(self, sdkfileid: str, filename: str | None = None) -> tuple[bytes, str | None]:
         matches = sorted(self.media_dir.glob(f"{Path(sdkfileid).stem}.*")) or sorted(
@@ -284,6 +343,113 @@ class RealWeComApi:
                 f"get_permit_user_list failed: {errcode} {payload.get('errmsg')}"
             )
         return [str(u) for u in (payload.get("ids") or []) if u]
+
+    # --- consent -----------------------------------------------------------
+
+    def _archive_post(self, path: str, body: dict[str, Any], label: str) -> dict[str, Any]:
+        """POST with the ARCHIVE secret's token, refreshing once on an expired one.
+
+        Shared by the consent and group-info calls so the token handling stays in
+        one place — every one of these must use the 会话内容存档 secret, and using
+        the app secret instead fails in a way that looks like a permissions bug.
+        """
+        with _client() as c:
+            r = c.post(
+                f"{WECOM_API_BASE}{path}",
+                params={"access_token": self.get_access_token(use_archive_secret=True)},
+                json=body,
+            )
+            payload = _json_or_raise(r, label)
+
+        if payload.get("errcode") in (40014, 42001, 42007, 42009):
+            self.get_access_token(force=True, use_archive_secret=True)
+            with _client() as c:
+                r = c.post(
+                    f"{WECOM_API_BASE}{path}",
+                    params={"access_token": self.get_access_token(use_archive_secret=True)},
+                    json=body,
+                )
+                payload = _json_or_raise(r, f"{label} (after token refresh)")
+        return payload
+
+    def check_room_agree(self, roomid: str) -> list[dict[str, Any]]:
+        """Consent state of every external member of `roomid` (doc `path/91782`).
+
+        Returns the raw `agreeinfo` list. `status` is the field that matters:
+        0 = 未同意, 1 = 同意, 2 = 不同意 — and only 同意 produces archived messages
+        from that external contact.
+        """
+        payload = self._archive_post(
+            ARCHIVE_CHECK_ROOM_AGREE_PATH, {"roomid": roomid}, "msgaudit/check_room_agree"
+        )
+        if payload.get("errcode"):
+            raise WeComApiError(
+                f"check_room_agree failed: {payload.get('errcode')} {payload.get('errmsg')}"
+            )
+        return [i for i in (payload.get("agreeinfo") or []) if isinstance(i, dict)]
+
+    def check_single_agree(self, userid: str, external_openid: str) -> list[dict[str, Any]]:
+        """Consent state for one (internal member, external contact) pair.
+
+        Note the request field is spelled `exteranalopenid` in the vendor doc —
+        that typo is in the API itself, not here.
+        """
+        payload = self._archive_post(
+            ARCHIVE_CHECK_SINGLE_AGREE_PATH,
+            {"info": [{"userid": userid, "exteranalopenid": external_openid}]},
+            "msgaudit/check_single_agree",
+        )
+        if payload.get("errcode"):
+            raise WeComApiError(
+                f"check_single_agree failed: {payload.get('errcode')} {payload.get('errmsg')}"
+            )
+        return [i for i in (payload.get("agreeinfo") or []) if isinstance(i, dict)]
+
+    def get_archive_group(self, roomid: str) -> dict[str, Any]:
+        """The archive's record of a group: its members and room id."""
+        payload = self._archive_post(
+            ARCHIVE_GROUP_INFO_PATH, {"roomid": roomid}, "msgaudit/groupchat/get"
+        )
+        if payload.get("errcode"):
+            raise WeComApiError(
+                f"groupchat/get failed: {payload.get('errcode')} {payload.get('errmsg')}"
+            )
+        return payload
+
+    def list_customer_groups(self, owner: str | None = None) -> list[dict[str, Any]]:
+        """Room ids of the 客户群 (customer groups), via the APP secret.
+
+        Needed because the archive cannot enumerate rooms: a silent pipeline
+        leaves you with no room id, and without one there is no way to ask
+        `check_room_agree` the one question that explains the silence. This call
+        requires the 客户联系 permission; errcode 60011 means the app lacks it.
+        """
+        body: dict[str, Any] = {"limit": 1000}
+        if owner:
+            body["owner_filter"] = {"userid_list": [owner]}
+        out: list[dict[str, Any]] = []
+        cursor = ""
+        for _ in range(10):  # bounded: 10 pages x 1000 groups is far past a trial
+            if cursor:
+                body["cursor"] = cursor
+            with _client() as c:
+                r = c.post(
+                    f"{WECOM_API_BASE}{EXTERNAL_GROUP_LIST_PATH}",
+                    params={"access_token": self.get_access_token()},
+                    json=body,
+                )
+                payload = _json_or_raise(r, "externalcontact/groupchat/list")
+            if payload.get("errcode"):
+                raise WeComApiError(
+                    f"groupchat/list failed: {payload.get('errcode')} {payload.get('errmsg')}"
+                )
+            out.extend(
+                g for g in (payload.get("group_chat_list") or []) if isinstance(g, dict)
+            )
+            cursor = str(payload.get("next_cursor") or "")
+            if not cursor:
+                break
+        return out
 
     # --- media -------------------------------------------------------------
 

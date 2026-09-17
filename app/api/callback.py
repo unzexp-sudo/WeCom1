@@ -504,6 +504,129 @@ def archive_scope() -> dict:
     }
 
 
+@router.get("/archive/consent", dependencies=[Depends(require_service_key)])
+def archive_consent(roomid: str | None = Query(default=None)) -> dict:
+    """Report whether the EXTERNAL contact has consented to archiving.
+
+    `GET /wecom/archive/scope` answers "is an employee being recorded?". It does
+    **not** answer "will this customer's message be recorded?", and the two are
+    independent. The doc is explicit (doc `path/91361`, 使用前帮助):
+
+        *"员工与外部联系人的会话内容，经外部联系人同意后，企业可通过API获取。"*
+
+    So an external contact who never tapped 同意 produces `fetched: 0` forever,
+    while the employee's own scope is perfectly configured — which is exactly the
+    state that reads as "the archive is broken" and is not.
+
+    **Getting a room id is the hard part.** The archive cannot enumerate rooms, so
+    on a silent pipeline there is nothing to pass in. When `roomid` is omitted
+    this endpoint tries to recover one from the 客户群 list
+    (`externalcontact/groupchat/list`, APP secret, needs the 客户联系 permission)
+    and falls back to reporting that failure — errcode 60011 there means the app
+    lacks 客户联系, which is a console fix, not a bug.
+
+    `status` values are returned RAW and only counted, never mapped: the vendor
+    page for this API does not print the enum in the section that is retrievable
+    without a session, and guessing it would be worse than reporting the number.
+    Cross-check any surprising value against the console's consent view.
+
+    Read-only, guarded, and never raises — a probe that 500s on the failure it
+    exists to explain is useless.
+    """
+    from app.adapters.wecom_api import WeComApiError, get_wecom_api
+
+    api = get_wecom_api()
+    configured = settings.staff_list()
+    out: dict = {
+        "ok": True,
+        "roomid_source": None,
+        "roomids": [],
+        "consent": [],
+        "discovery_error": None,
+        "hint": None,
+    }
+
+    roomids: list[str] = []
+    if roomid:
+        roomids = [roomid.strip()]
+        out["roomid_source"] = "explicit"
+    else:
+        out["roomid_source"] = "discovered"
+        try:
+            groups = api.list_customer_groups(owner=configured[0] if configured else None)
+        except WeComApiError as exc:
+            out["ok"] = False
+            out["discovery_error"] = str(exc)
+            out["hint"] = (
+                "Could not list 客户群. errcode 60011 means the app is missing the "
+                "客户联系 permission — grant it, or call this endpoint with "
+                "?roomid=<wr...> once you have a room id from a message. The room "
+                "id is the `chatid` on an archived message and also the group's id "
+                "in the console."
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001 - report, never 500
+            logger.exception("Consent probe: customer-group listing failed")
+            out["ok"] = False
+            out["discovery_error"] = f"{type(exc).__name__}: {exc}"
+            out["hint"] = "The 客户群 listing failed for a non-API reason; see the log."
+            return out
+        roomids = [str(g.get("chat_id")) for g in groups if g.get("chat_id")]
+        if not roomids:
+            out["ok"] = False
+            out["hint"] = (
+                "The app can list 客户群 but there are none. The customer group the "
+                "order was sent in is therefore not a 客户群 owned by a member with "
+                "客户联系 — which also means it is not archivable as an external "
+                "session. Recreate it from the 客户联系 side, or add the customer "
+                "as an external contact first."
+            )
+            return out
+
+    out["roomids"] = roomids
+    for rid in roomids:
+        row: dict = {"roomid": rid, "agreeinfo": [], "status_counts": {}, "error": None}
+        try:
+            info = api.check_room_agree(rid)
+        except WeComApiError as exc:
+            row["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - one room must not stop the rest
+            logger.exception("Consent probe failed for roomid=%s", rid)
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            row["agreeinfo"] = info
+            counts: dict[str, int] = {}
+            for entry in info:
+                counts[str(entry.get("status"))] = counts.get(str(entry.get("status")), 0) + 1
+            row["status_counts"] = counts
+            if not info:
+                row["error"] = (
+                    "no external members returned — the room has no external "
+                    "contact in it, so there is nothing to consent"
+                )
+        out["consent"].append(row)
+
+    pending = [
+        r for r in out["consent"] if any(str(e.get("status")) not in ("1",) for e in r["agreeinfo"])
+    ]
+    if pending:
+        out["hint"] = (
+            "At least one external member of these rooms is not in the consented "
+            "state (status 1 is the consented value). Until they tap 同意, their "
+            "messages — and the whole conversation — are not archived, no matter "
+            "how correct the pull is. The customer gets a consent card in WeChat "
+            "when they are added; ask them to open it and agree."
+        )
+    else:
+        out["hint"] = (
+            "Every external member returned is consented, so consent is NOT the "
+            "reason the pull is empty. Next: confirm a 消息加密公钥 (public key) is "
+            "set on the Message Archiving page — without one WeCom does not "
+            "archive at all."
+        )
+    return out
+
+
 @router.get("/archive/sdk", dependencies=[Depends(require_service_key)])
 def archive_sdk() -> dict:
     """Report whether the archive MEDIA path can actually work.
