@@ -77,6 +77,12 @@ def _first_text(value: Any) -> str | None:
     return None
 
 
+# Msgtypes that carry an attachment, i.e. the ones that go through
+# `download_media`. Shared with `retry_media_download` and with the `rehand`
+# endpoint, so "does this message have an attachment to fetch?" has one answer.
+MEDIA_MSGTYPES = ("image", "file", "voice", "mixed")
+
+
 def _media(item: dict, msgtype: str) -> tuple[str | None, str | None, str | None]:
     """Return (sdkfileid, filename, md5) for one archive item."""
     body = item.get(msgtype) if isinstance(item.get(msgtype), dict) else None
@@ -262,6 +268,87 @@ def _alert_ops_unresolved(db, msg: WeComMessageLog, api=None) -> None:
     logger.info("OPS ALERT (unresolved customer): %s", text)
 
 
+def _store_media(row, *, sdkfileid: str, filename: str | None, msgtype: str, api, storage) -> None:
+    """Download one attachment and record it on the row.
+
+    Shared by the ingest path and the retry path so a retry cannot drift from
+    the original: both must pick the same filename, the same mime and the same
+    `source_type`, or a retried attachment would land under a different type
+    than the one the first attempt would have produced.
+    """
+    from app.adapters.storage import guess_mime
+
+    content, saved_name = api.download_media(sdkfileid, filename)
+    name = saved_name or filename or sdkfileid
+    mime = guess_mime(name)
+    path, url = storage.save(name, content, mime)
+    row.file_path = path
+    row.file_url = url
+    row.file_mime = mime
+    row.source_type = "text" if msgtype == "voice" else source_type_for(msgtype, name)
+    if msgtype == "voice":
+        row.content_text = VOICE_NOTE
+
+
+def retry_media_download(db, msg: WeComMessageLog, *, api=None, storage=None) -> tuple[bool, str | None]:
+    """Re-attempt the attachment download for a message that failed ingest.
+
+    **Why this exists.** When `api.download_media` raises, `ingest_entry` catches
+    it, marks the row `failed`, and `pull_once` then **holds the archive cursor
+    at that seq** — deliberately, so the order is never lost. The recovery path
+    that comment names is `POST /wecom/messages/{id}/rehand`.
+
+    But `rehand` only ever re-ran the ERP *handoff*. For a download failure that
+    did nothing useful: the row has no `file_url`, so it handed the ERP a
+    message with no attachment, the cursor stayed held, and the next pull
+    re-fetched the same entry and failed again. The wedge was permanent.
+
+    The `sdkfileid` was never the problem — `raw` stores the whole original
+    entry, so it is still there. Nothing was reading it. This reads it.
+    """
+    if msg.file_url:
+        return True, None  # already have the bytes; nothing to retry
+
+    msgtype = (msg.msgtype or "").strip().lower()
+    if msgtype not in MEDIA_MSGTYPES:
+        return False, f"msgtype={msgtype or 'unknown'} carries no attachment"
+
+    # Reuse `normalize_entry` rather than reaching into `raw` by hand: it is the
+    # same extraction the first attempt used, including the `mixed` case where
+    # the sdkfileid lives inside `msg_item`.
+    norm = normalize_entry(msg.raw if isinstance(msg.raw, dict) else {})
+    sdkfileid = norm.get("sdkfileid")
+    if not sdkfileid:
+        return False, (
+            "no sdkfileid in the stored entry — the attachment cannot be retried. "
+            "Re-pull once the entry is still within the archive's retention window."
+        )
+
+    if api is None:
+        from app.adapters.wecom_api import get_wecom_api
+
+        api = get_wecom_api()
+    if storage is None:
+        from app.adapters.storage import get_storage
+
+        storage = get_storage()
+
+    try:
+        _store_media(
+            msg,
+            sdkfileid=sdkfileid,
+            filename=norm.get("filename"),
+            msgtype=msgtype,
+            api=api,
+            storage=storage,
+        )
+    except Exception as exc:  # noqa: BLE001 - report, let the caller keep it failed
+        logger.warning("Media retry failed for msgid=%s: %s", msg.msgid, exc)
+        return False, f"{type(exc).__name__}: {exc}"
+
+    return True, None
+
+
 def ingest_entry(db, entry: dict, *, erp=None, api=None, storage=None) -> IngestResult:
     """Ingest one decrypted archive entry. Never raises; always reports a status."""
     norm = normalize_entry(entry)
@@ -412,23 +499,15 @@ def ingest_entry(db, entry: dict, *, erp=None, api=None, storage=None) -> Ingest
                 msgid=msgid, status="ignored", customer_id=row.customer_id, bind_status=row.bind_status
             )
 
-        if msgtype in ("image", "file", "voice", "mixed") and norm.get("sdkfileid"):
-            from app.adapters.storage import guess_mime
-
-            content, saved_name = api.download_media(
-                norm["sdkfileid"], norm.get("filename")
+        if msgtype in MEDIA_MSGTYPES and norm.get("sdkfileid"):
+            _store_media(
+                row,
+                sdkfileid=norm["sdkfileid"],
+                filename=norm.get("filename"),
+                msgtype=msgtype,
+                api=api,
+                storage=storage,
             )
-            name = saved_name or norm.get("filename") or norm["sdkfileid"]
-            mime = guess_mime(name)
-            path, url = storage.save(name, content, mime)
-            row.file_path = path
-            row.file_url = url
-            row.file_mime = mime
-            row.source_type = (
-                "text" if msgtype == "voice" else source_type_for(msgtype, name)
-            )
-            if msgtype == "voice":
-                row.content_text = VOICE_NOTE
         else:
             row.source_type = source_type_for(msgtype, norm.get("filename"))
 

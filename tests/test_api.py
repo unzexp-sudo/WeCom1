@@ -71,9 +71,9 @@ def test_health_points_at_the_gate_switch_when_it_is_off(client, monkeypatch):
 
 def test_health_warns_that_pure_cannot_download_attachments(client, monkeypatch):
     """`pure` decrypts messages but cannot fetch media, and a failed entry holds
-    the archive cursor — so the first attachment blocks everything behind it, and
-    rehand repeats the same failing download. Health has to say this *before* it
-    happens, because the symptom (a stalled cursor) points nowhere near the cause.
+    the archive cursor — so the first attachment blocks everything behind it.
+    Health has to say this *before* it happens, because the symptom (a stalled
+    cursor) points nowhere near the cause.
     """
     monkeypatch.setattr(settings, "decrypt_provider", "pure")
 
@@ -81,6 +81,13 @@ def test_health_warns_that_pure_cannot_download_attachments(client, monkeypatch)
     warnings = body["config"]["warnings"]
     assert any("ATTACHMENTS" in w for w in warnings)
     assert any("HOLDS THE ARCHIVE CURSOR" in w for w in warnings)
+    # The warning must name a route that actually works. It used to say rehand
+    # "repeats the same download" and could not clear the block — which was true
+    # until rehand learned to re-download.
+    assert any("rehand" in w for w in warnings), (
+        "the warning must tell the operator how to clear the held cursor"
+    )
+    assert not any("unable to clear" in w for w in warnings)
     assert body["config"]["archive_sdk_path_set"] is False
 
 
@@ -422,6 +429,145 @@ def test_rehand_retries_a_failed_handoff(client, db, mock_erp):
 
 def test_rehand_unknown_message_is_404(client):
     assert client.post("/wecom/messages/nope/rehand").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# rehand must also re-download the attachment
+# ---------------------------------------------------------------------------
+#
+# The wedge these exist to clear: `pull_once` holds the archive cursor at a
+# failed entry, so the first attachment a customer sends blocks every message
+# behind it. Re-running only the ERP handoff could never clear that — the row
+# had no `file_url`, so the ERP received a message with no attachment, the
+# status flipped to `handed_off`, and the cursor stayed held while the next pull
+# failed the same download again. The `sdkfileid` was never lost (it is in
+# `raw`); nothing was reading it.
+
+
+def _media_row(db, *, msgid: str, **kw):
+    msg = WeComMessageLog(
+        msgid=msgid,
+        msgtype="image",
+        status="failed",
+        error="WeComApiError: mock media not found",
+        raw={"msgid": msgid, "msgtype": "image", "image": {"sdkfileid": msgid}},
+        **kw,
+    )
+    db.add(msg)
+    db.commit()
+    return msg
+
+
+def _put_mock_media(name: str, content: bytes = b"\xff\xd8\xffJPEG") -> None:
+    d = pathlib.Path(settings.mock_media_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_bytes(content)
+
+
+def test_rehand_redownloads_an_attachment_that_never_arrived(
+    client, db, mock_api, mock_erp
+):
+    _put_mock_media("wm-media-1.jpg")
+    msg = _media_row(db, msgid="wm-media-1")
+
+    body = client.post(f"/wecom/messages/{msg.id}/rehand").json()
+
+    assert body["media_retried"] is True
+    assert body["message"]["file_url"], "the attachment was not stored on the retry"
+    assert body["message"]["status"] == "handed_off"
+
+
+def test_rehand_stays_failed_when_the_retry_also_fails(client, db, mock_api, mock_erp):
+    """A second failure must NOT be reported as success.
+
+    Handing off anyway would send the ERP a message with no attachment and mark
+    it `handed_off`, hiding the problem behind a success status — and the cursor
+    would stay held with no way to tell why.
+    """
+    msg = _media_row(db, msgid="wm-media-missing")
+
+    body = client.post(f"/wecom/messages/{msg.id}/rehand").json()
+
+    assert body["ok"] is False
+    assert "media retry failed" in body["error"]
+    assert body["message"]["status"] == "failed"
+    assert not body["message"]["file_url"]
+    assert mock_erp.calls == [], "the ERP was called with a missing attachment"
+
+
+def test_rehand_does_not_redownload_when_the_attachment_is_already_stored(
+    client, db, mock_api, mock_erp
+):
+    """Idempotent: a stored attachment is never fetched twice."""
+    msg = _media_row(db, msgid="wm-media-3", file_url="https://gw/wecom/media/x.jpg")
+
+    body = client.post(f"/wecom/messages/{msg.id}/rehand").json()
+
+    assert body["media_retried"] is False
+    assert body["ok"] is True
+
+
+def test_retry_reads_the_sdkfileid_out_of_the_stored_entry(db, mock_api):
+    """The recovery data was always there — `raw` holds the whole entry."""
+    from app.services.ingestor import retry_media_download
+
+    _put_mock_media("wm-mixed-9.jpg")
+    msg = WeComMessageLog(
+        msgid="wm-mixed-9",
+        msgtype="mixed",
+        status="failed",
+        # A `mixed` message keeps its attachment inside `msg_item`, so a retry
+        # that only looked at the top level would find nothing to fetch.
+        raw={
+            "msgid": "wm-mixed-9",
+            "msgtype": "mixed",
+            "mixed": {
+                "msg_item": [
+                    {"msgtype": "text", "text": {"content": "请按图片下单"}},
+                    {"msgtype": "image", "image": {"sdkfileid": "wm-mixed-9"}},
+                ]
+            },
+        },
+    )
+    db.add(msg)
+    db.commit()
+
+    ok, error = retry_media_download(db, msg)
+
+    assert ok, error
+    assert msg.file_url
+    assert msg.file_mime == "image/jpeg"
+
+
+def test_retry_refuses_a_message_that_carries_no_attachment(db, mock_api):
+    from app.services.ingestor import retry_media_download
+
+    msg = WeComMessageLog(msgid="wm-text-1", msgtype="text", status="failed", raw={})
+    db.add(msg)
+    db.commit()
+
+    ok, error = retry_media_download(db, msg)
+
+    assert ok is False
+    assert "no attachment" in error
+
+
+def test_retry_reports_a_missing_sdkfileid_rather_than_pretending(db, mock_api):
+    from app.services.ingestor import retry_media_download
+
+    msg = WeComMessageLog(
+        msgid="wm-img-empty",
+        msgtype="image",
+        status="failed",
+        raw={"msgid": "wm-img-empty", "msgtype": "image", "image": {}},
+    )
+    db.add(msg)
+    db.commit()
+
+    ok, error = retry_media_download(db, msg)
+
+    assert ok is False
+    assert "no sdkfileid" in error
 
 
 def test_contacts_list(client, db):

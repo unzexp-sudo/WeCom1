@@ -118,18 +118,24 @@ def _config_readiness() -> dict:
     # official C SDK and raises under `pure`. That matters more than it sounds:
     # a customer order usually IS an attachment, and `pull_once` deliberately
     # holds the cursor on a failed entry, so the first attachment would block
-    # every later message behind it — and `POST /wecom/messages/{id}/rehand`
-    # re-runs the same failing download, so it cannot clear it either.
+    # every later message behind it.
+    #
+    # The recovery route is `POST /wecom/messages/{id}/rehand`, which re-downloads
+    # the attachment and then re-runs the handoff. This warning previously said
+    # rehand "repeats the same download" and so could not clear the block — that
+    # was true of the old handler, which only re-ran the handoff. It is no longer
+    # true, and a warning that sends the operator to a dead end is worse than one
+    # that says nothing.
     provider = (settings.decrypt_provider or "pure").strip().lower()
     if provider != "sdk":
         warnings.append(
             f"WECOM_DECRYPT_PROVIDER is {provider!r}, so archived ATTACHMENTS "
             "cannot be downloaded. Text still ingests, but the first image/file/"
             "voice message will fail, and a failed entry HOLDS THE ARCHIVE "
-            "CURSOR — blocking every later message behind it, with rehand unable "
-            "to clear it (it repeats the same download). Set the provider to "
-            "'sdk' and WECOM_ARCHIVE_SDK_PATH before real orders, which are "
-            "attachments, start arriving."
+            "CURSOR — blocking every later message behind it. Clear it with "
+            "POST /wecom/messages/{id}/rehand once this is fixed. Set the "
+            "provider to 'sdk' before real orders, which are attachments, start "
+            "arriving."
         )
     if key_path and not os.path.exists(key_path):
         warnings.append(

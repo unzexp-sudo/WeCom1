@@ -178,7 +178,10 @@ def pull_once(db, *, api=None, erp=None) -> dict:
     #
     # Trade-off: a persistently failing entry blocks the cursor (head-of-line).
     # That is deliberate — §4.8 "never lose the message"; operators clear it
-    # with POST /wecom/messages/{id}/rehand.
+    # with POST /wecom/messages/{id}/rehand, which re-downloads the attachment
+    # if that is what failed, and then re-runs the handoff. (It has to do both:
+    # for a download failure the handoff alone changes nothing, because there is
+    # no file_url to send and the entry is re-fetched identically on every pull.)
     if failed_seqs:
         blocked_at = min(failed_seqs)
         safe = [s for s in seqs if s < blocked_at]
