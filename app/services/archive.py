@@ -11,7 +11,12 @@ import logging
 import threading
 from typing import Any
 
-from app.adapters.sdk_process import DEATH_DECRYPT, DEATH_INIT, DEATH_PRELOAD
+from app.adapters.sdk_process import (
+    DEATH_DECRYPT,
+    DEATH_INIT,
+    DEATH_LIBRARY,
+    DEATH_PRELOAD,
+)
 from app.core.config import REPO_ROOT, settings
 from app.core.database import SessionLocal
 from app.models.base import utcnow
@@ -313,7 +318,19 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         shape_mod16 = (first_shape or {}).get("encrypt_chat_msg_mod16")
         first_error = stats.get("first_error") or ""
         provider = (settings.decrypt_provider or "pure").strip().lower()
-        if DEATH_INIT in first_error:
+        if DEATH_LIBRARY in first_error:
+            # An ABI/platform death. Checked before DEATH_INIT because `load()`
+            # covers both the dlopen and `Init()`, and the two have nothing in
+            # common: this one cannot be fixed from the console at all.
+            cause = (
+                "The decrypt worker died while loading the SDK shared library. That "
+                "is an ABI or platform fault, not a credential and not a key: the "
+                "library is a Linux ELF and WeCom ships separate x86 and arm builds, "
+                "so the wrong archive (or a glibc the blob was not built against) "
+                "fails exactly here. Re-provision the SDK for this platform; no "
+                "console change and no key change will affect it. "
+            )
+        elif DEATH_INIT in first_error:
             # Checked before everything else because it is the most specific, and
             # because the branches below would all mislabel it. The worker died
             # inside `Init()`: the library was never usable, so this is global and

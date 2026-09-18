@@ -350,6 +350,44 @@ def test_an_init_rejection_blames_the_credentials_not_the_provider(db, monkeypat
     assert "WECOM_DECRYPT_PROVIDER=sdk" not in hint
 
 
+def test_a_death_loading_the_library_does_not_send_anyone_to_the_console(db, monkeypatch):
+    """An ABI/platform death must not read as a credential fault.
+
+    `load()` does the dlopen and `Init()` together, so before the split this death
+    produced the credential sentence — sending the operator to edit a secret and a
+    Trusted IP list while the real fault was the binary that was deployed.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+
+    class _DiedLoading:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 19,
+                "decrypt_failed": 1,
+                "failed_seqs": [1],
+                "first_error": (
+                    "DecryptError: the SDK worker died while loading the shared "
+                    "library — the .so failed to load or aborted during load."
+                ),
+                "first_error_shape": None,
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    hint = archive.pull_once(db, api=_DiedLoading())["hint"]
+
+    assert "loading the SDK shared library" in hint
+    assert "not a credential" in hint
+    assert "x86" in hint
+    # The three wrong turns this branch exists to prevent.
+    assert "WECOM_ARCHIVE_SECRET" not in hint
+    assert "Trusted IP" not in hint
+    assert "re-uploading a key will not help" not in hint
+
+
 def test_a_worker_death_in_init_blames_the_credentials_not_the_key(db, monkeypatch):
     """A contained abort must not be reported as a key fault.
 

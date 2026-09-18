@@ -85,10 +85,13 @@ def handle(request: dict) -> dict:
         sdk_path = (request.get("sdk_path") or "").strip()
         if sdk_path:
             sdk.path = sdk_path
-        # `load()` is idempotent and `decrypt()` calls it too, so naming it here
-        # costs nothing and splits the two native calls apart: without this the
-        # `stage=decrypt` marker would cover the initialisation as well, and a
-        # credential fault would look exactly like an unreadable message.
+        # `load_library()` and `load()` are both idempotent and `decrypt()` calls
+        # them anyway, so naming them here costs nothing — and it is what keeps
+        # three very different faults apart. `load()` alone would cover the dlopen
+        # AND `Init()`, so an ABI/architecture failure would be reported as a
+        # credential fault and send the operator to the wrong console page.
+        _stage("library")
+        sdk.load_library()
         _stage("init")
         sdk.load()
         _stage("decrypt")

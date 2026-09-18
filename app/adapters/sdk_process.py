@@ -31,26 +31,38 @@ STDERR_TAIL = 400
 # because it sends the operator to fix the wrong thing. Telling someone to
 # re-upload a key when the child actually aborted in `Init()` costs a full round
 # trip, and that has already happened here more than once.
+DEATH_LIBRARY = "the SDK worker died while loading the shared library"
 DEATH_INIT = "the SDK worker died during Init()"
 DEATH_DECRYPT = "the SDK worker died during DecryptData"
 DEATH_PRELOAD = "the SDK worker died before announcing a stage"
 
-_DEATH_LEAD = {"init": DEATH_INIT, "decrypt": DEATH_DECRYPT}
+_DEATH_LEAD = {
+    "library": DEATH_LIBRARY,
+    "init": DEATH_INIT,
+    "decrypt": DEATH_DECRYPT,
+}
 
-# What a death at each stage means. The distinction decides the fix: an `Init()`
-# death is global and fails every entry identically, while a `DecryptData` death
-# is per-message and leaves the rest of the archive readable.
+# What a death at each stage means. The distinction decides the fix, and the fixes
+# do not overlap at all: an ABI failure is environmental and unfixable from the
+# console, an `Init()` failure is a credential or Trusted-IP problem, and a
+# `DecryptData` failure is per-message.
 _DEATH_MEANING = {
+    DEATH_LIBRARY: (
+        " — the .so failed to load or aborted during load. That is an ABI or "
+        "platform problem (the wrong architecture, or a glibc mismatch), NOT a "
+        "credential or key problem, so no console change will help"
+    ),
     DEATH_INIT: (
-        " — a credential or library-load fault, so every entry will fail the same "
-        "way and no key change will help"
+        " — the credential call was rejected or aborted, so every entry will fail "
+        "the same way and no key change will help"
     ),
     DEATH_DECRYPT: (
         " — per-message, so only entries shaped like this one are affected, and the "
         "library aborted rather than returning an error code"
     ),
     DEATH_PRELOAD: (
-        " — the library itself failed to load, before any call was made"
+        " — the worker died before making any call, so the interpreter or its "
+        "imports failed rather than the vendor library"
     ),
 }
 
@@ -97,7 +109,7 @@ def death_kind(stderr: bytes) -> str:
 # Faults that make EVERY remaining entry fail identically. Retrying them spawns
 # one doomed worker per entry and prints one identical ERROR per entry — which
 # reads as a flood and buries the single real cause.
-_GLOBAL_FAULTS = (DEATH_INIT, DEATH_PRELOAD, "Init() failed")
+_GLOBAL_FAULTS = (DEATH_LIBRARY, DEATH_INIT, DEATH_PRELOAD, "Init() failed")
 
 
 def is_global_fault(error: str) -> bool:

@@ -742,9 +742,10 @@ def test_a_stage_marker_survives_a_noisy_child(monkeypatch):
 def test_the_worker_announces_each_stage_before_the_native_call(monkeypatch):
     """Pins the ORDER, which is the whole diagnostic value.
 
-    `decrypt()` calls `load()` internally, so without an explicit marker the
-    `stage=decrypt` label would also cover the initialisation — and a credential
-    fault would be reported as an unreadable message.
+    Three stages, not one: `load()` covers both the dlopen and `Init()`, so
+    without the explicit `library` marker an ABI/architecture failure would be
+    reported as a credential fault and send the operator to the wrong console
+    page. `decrypt()` also calls both internally, hence the explicit calls here.
     """
     import types
 
@@ -754,6 +755,9 @@ def test_the_worker_announces_each_stage_before_the_native_call(monkeypatch):
 
     class FakeSdk:
         path = ""
+
+        def load_library(self):
+            events.append("load_library")
 
         def load(self):
             events.append("load")
@@ -773,7 +777,14 @@ def test_the_worker_announces_each_stage_before_the_native_call(monkeypatch):
     )
 
     assert reply == {"ok": True, "text": '{"msgtype":"text"}'}
-    assert events == ["stage:init", "load", "stage:decrypt", "decrypt"]
+    assert events == [
+        "stage:library",
+        "load_library",
+        "stage:init",
+        "load",
+        "stage:decrypt",
+        "decrypt",
+    ]
 
 
 def test_the_worker_process_speaks_the_protocol():
@@ -1004,10 +1015,12 @@ def test_is_global_fault_separates_init_deaths_from_message_deaths():
     from app.adapters.sdk_process import (
         DEATH_DECRYPT,
         DEATH_INIT,
+        DEATH_LIBRARY,
         DEATH_PRELOAD,
         is_global_fault,
     )
 
+    assert is_global_fault(f"DecryptError: {DEATH_LIBRARY} — ...")
     assert is_global_fault(f"DecryptError: {DEATH_INIT} — ...")
     assert is_global_fault(f"DecryptError: {DEATH_PRELOAD} — ...")
     assert is_global_fault("DecryptError: Init() failed: 10009 (ip非法)")
@@ -1015,6 +1028,37 @@ def test_is_global_fault_separates_init_deaths_from_message_deaths():
     assert not is_global_fault(f"DecryptError: {DEATH_DECRYPT} — ...")
     assert not is_global_fault("DecryptError: RSA decrypt failed: bad padding")
     assert not is_global_fault("")
+
+
+def test_a_death_during_the_dlopen_is_not_reported_as_a_credential_fault(monkeypatch):
+    """An ABI failure and a credential failure need opposite responses.
+
+    `load()` performs BOTH the dlopen and `Init()`. Reported as one stage, a wrong
+    architecture (or a glibc the blob was not built against) reads as "check your
+    secret and Trusted IP" — so the operator edits the console while the actual
+    problem is the binary they deployed. The two are now separate markers.
+    """
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=-6,
+            stdout=b"",
+            stderr=b"[worker] stage=library\nfree(): invalid pointer\n",
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+
+    text = str(e.value)
+    assert "loading the shared library" in text
+    assert "ABI" in text
+    assert "NOT a credential" in text
+    assert "WECOM_ARCHIVE_SECRET" not in text
+    assert "Trusted IP" not in text
 
 
 def test_get_chat_data_stops_at_the_first_global_fault(monkeypatch):
