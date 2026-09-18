@@ -350,6 +350,124 @@ def test_an_init_rejection_blames_the_credentials_not_the_provider(db, monkeypat
     assert "WECOM_DECRYPT_PROVIDER=sdk" not in hint
 
 
+def test_a_worker_death_in_init_blames_the_credentials_not_the_key(db, monkeypatch):
+    """A contained abort must not be reported as a key fault.
+
+    Once the vendor call runs in a child process, the first-error text becomes
+    "the SDK worker died during Init()" — which contains neither `Init() failed`
+    nor any shape signal. Without a branch of its own it fell through to the final
+    `else` and told the operator to re-upload a key, sending them to the console
+    for a fault that is in the credentials. That is the exact round trip this hint
+    exists to prevent, so the death kinds are matched first.
+    """
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+
+    class _WorkerDied:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 19,
+                "decrypt_failed": 1,
+                "failed_seqs": [1],
+                "first_error": (
+                    "DecryptError: the SDK worker died during Init() — a credential "
+                    "or library-load fault, so every entry will fail the same way. "
+                    "the vendor library aborted its own process (SIGABRT)."
+                ),
+                "first_error_shape": {
+                    "encrypt_chat_msg_bytes": 327,
+                    "encrypt_chat_msg_mod16": 7,
+                },
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    hint = archive.pull_once(db, api=_WorkerDied())["hint"]
+
+    assert "died inside the library's Init()" in hint
+    assert "WECOM_ARCHIVE_SECRET" in hint
+    assert "Trusted IP" in hint
+    # The three mislabels this branch has to beat.
+    assert "re-uploading a key will not help" not in hint
+    assert "WECOM_DECRYPT_PROVIDER=sdk" not in hint
+    assert "key fault" not in hint
+
+
+def test_a_worker_death_in_decrypt_says_the_key_is_not_implicated(db, monkeypatch):
+    """The per-message death, and it must not read as a key fault either.
+
+    This one is the library aborting on the native decrypt call. The key has been
+    measured against the console's public key and matches, so the hint has to say
+    so explicitly — otherwise the next reader repeats the key hunt we already did.
+    """
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+
+    class _WorkerDied:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 19,
+                "decrypt_failed": 1,
+                "failed_seqs": [1],
+                "first_error": (
+                    "DecryptError: the SDK worker died during DecryptData — "
+                    "per-message, so only entries shaped like this one are affected. "
+                    "the vendor library aborted its own process (SIGABRT)."
+                ),
+                "first_error_shape": {
+                    "encrypt_chat_msg_bytes": 327,
+                    "encrypt_chat_msg_mod16": 7,
+                },
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    hint = archive.pull_once(db, api=_WorkerDied())["hint"]
+
+    assert "died inside the native DecryptData call" in hint
+    assert "re-uploading a key will not help" in hint
+    assert "WECOM_DECRYPT_PROVIDER=sdk" not in hint
+
+
+def test_a_worker_death_before_any_call_blames_the_library_load(db, monkeypatch):
+    """No stage marker means the .so never loaded — a platform problem.
+
+    WeCom ships separate x86 and arm archives and Railway is x86-64, so a wrong
+    archive produces exactly this and nothing else.
+    """
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+
+    class _WorkerDied:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 19,
+                "decrypt_failed": 1,
+                "failed_seqs": [1],
+                "first_error": (
+                    "DecryptError: the SDK worker died before announcing a stage — "
+                    "the library itself failed to load."
+                ),
+                "first_error_shape": None,
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    hint = archive.pull_once(db, api=_WorkerDied())["hint"]
+
+    assert "failed to load" in hint
+    assert "x86" in hint
+
+
 def test_a_block_aligned_ciphertext_still_blames_the_key(db):
     """The other side of that branch. Without this, the fix above would have
     swapped one unconditional wrong answer for another.

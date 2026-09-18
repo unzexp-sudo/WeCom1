@@ -53,6 +53,19 @@ def _write(obj: dict) -> None:
     os.write(_PROTO_FD, (json.dumps(obj) + "\n").encode("utf-8"))
 
 
+def _stage(name: str) -> None:
+    """Announce the stage on stderr, where an abort cannot erase it.
+
+    The abort this file exists to contain leaves **no** other evidence: it kills
+    the process before any reply is written, so the parent learns only that the
+    child died. The last marker standing is therefore the whole answer to "which
+    native call did it?" — and that distinction decides the fix, because an
+    `Init()` abort fails every entry identically while a `DecryptData` abort is
+    per-message. See `sdk_process._STAGE_MEANING`.
+    """
+    print(f"[worker] stage={name}", file=sys.stderr, flush=True)
+
+
 def handle(request: dict) -> dict:
     """Answer one request. Never raises — the parent must always get a reply."""
     op = request.get("op")
@@ -72,6 +85,13 @@ def handle(request: dict) -> dict:
         sdk_path = (request.get("sdk_path") or "").strip()
         if sdk_path:
             sdk.path = sdk_path
+        # `load()` is idempotent and `decrypt()` calls it too, so naming it here
+        # costs nothing and splits the two native calls apart: without this the
+        # `stage=decrypt` marker would cover the initialisation as well, and a
+        # credential fault would look exactly like an unreadable message.
+        _stage("init")
+        sdk.load()
+        _stage("decrypt")
         return {"ok": True, "text": sdk.decrypt(key, request.get("msg") or "")}
     except SdkLibraryError as exc:
         return {"ok": False, "error": str(exc)}

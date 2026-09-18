@@ -11,6 +11,7 @@ import logging
 import threading
 from typing import Any
 
+from app.adapters.sdk_process import DEATH_DECRYPT, DEATH_INIT, DEATH_PRELOAD
 from app.core.config import REPO_ROOT, settings
 from app.core.database import SessionLocal
 from app.models.base import utcnow
@@ -312,7 +313,37 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         shape_mod16 = (first_shape or {}).get("encrypt_chat_msg_mod16")
         first_error = stats.get("first_error") or ""
         provider = (settings.decrypt_provider or "pure").strip().lower()
-        if "Init() failed" in first_error:
+        if DEATH_INIT in first_error:
+            # Checked before everything else because it is the most specific, and
+            # because the branches below would all mislabel it. The worker died
+            # inside `Init()`: the library was never usable, so this is global and
+            # has nothing to do with the message content or the archive key.
+            cause = (
+                "The decrypt worker died inside the library's Init() call, so the "
+                "library was never usable and EVERY entry fails the same way — this "
+                "is not about the message content, and not about the archive key. "
+                "Init() is the credential call: check WECOM_ARCHIVE_SECRET, and "
+                "check that this egress IP is in the archive's Trusted IP list (a "
+                "rejection there is code 10009). That address is a POOL, so allow "
+                "every address you have seen rather than the most recent one. "
+            )
+        elif DEATH_DECRYPT in first_error:
+            cause = (
+                "The decrypt worker died inside the native DecryptData call — the "
+                "library aborted its own process instead of returning an error code. "
+                "That is a fault in the library or in how it is loaded here, not a "
+                "wrong key and not a bad message: the archive private key has been "
+                "measured against the console's public key and it matches, so "
+                "re-uploading a key will not help. "
+            )
+        elif DEATH_PRELOAD in first_error:
+            cause = (
+                "The decrypt worker died before it could make a single call, so the "
+                "library failed to load. Check that the SDK .so for this platform "
+                "was fetched — WeCom ships separate x86 and arm archives and they are "
+                "not interchangeable, and Railway runs Linux x86-64. "
+            )
+        elif "Init() failed" in first_error:
             # Checked first because it is the most specific, and because both
             # branches below would mislabel it. `mod16 != 0` is a property of the
             # envelope and holds under EVERY provider, so gating on it alone told

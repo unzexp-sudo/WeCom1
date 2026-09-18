@@ -305,6 +305,7 @@ class RealWeComApi:
 
     def get_chat_data(self, seq: int, limit: int, timeout: int) -> list[dict[str, Any]]:
         from app.adapters.decrypt import decrypt_entry, get_decryptor, probe_entry_shape
+        from app.adapters.sdk_process import is_global_fault
 
         with _client() as c:
             r = c.post(
@@ -373,6 +374,21 @@ class RealWeComApi:
                     bad_seq = 0
                 if bad_seq:
                     failed_seqs.append(bad_seq)
+                if is_global_fault(f"{type(exc).__name__}: {exc}"):
+                    # A global fault — the worker died in `Init()`, the library
+                    # failed to load, or `Init()` was rejected — makes EVERY
+                    # remaining entry fail identically. Carrying on would spawn one
+                    # doomed worker per entry and print one identical ERROR each,
+                    # which reads as a flood and buries the single real cause. The
+                    # cursor already holds on this first unreadable seq, so breaking
+                    # here skips nothing.
+                    logger.warning(
+                        "Stopping this pull at the first failed entry: the fault is "
+                        "global, so every remaining entry would fail the same way. "
+                        "Cause: %s",
+                        first_error,
+                    )
+                    break
                 continue
             entry.setdefault("seq", envelope.get("seq"))
             entry.setdefault("msgid", envelope.get("msgid"))
@@ -397,10 +413,10 @@ class RealWeComApi:
             logger.error(
                 "Archive decryption failed for %s of %s entries (first: %s). "
                 "The pull reports fetched=%s, and a TOTAL failure is byte-identical "
-                "to an empty archive in the response — hence this ERROR. Usual "
-                "cause: the private key no longer matches the public key currently "
-                "set on the Message Archiving page, because regenerating the pair "
-                "in the console changes which key WeCom encrypts with.",
+                "to an empty archive in the response — hence this ERROR. The cause "
+                "is named in the first-failure text above and repeated by "
+                "/wecom/health as a hint; do not assume the key, which has been "
+                "measured and matches.",
                 decrypt_failed,
                 len(chatdata),
                 first_error,

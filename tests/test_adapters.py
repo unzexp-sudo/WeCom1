@@ -648,6 +648,134 @@ def test_a_hung_worker_is_killed_and_reported(monkeypatch):
     assert "did not answer" in str(e.value)
 
 
+def test_a_death_during_init_is_named_as_a_credential_fault(monkeypatch):
+    """An abort leaves no reply, so the child's stage marker is the ONLY evidence.
+
+    The two native calls have non-overlapping fixes — a death in `Init()` fails
+    every entry identically, a death in `DecryptData` affects one message — so
+    reporting them the same way sends the next reader hunting for a bad message
+    while the credentials are what is wrong.
+    """
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=-6,
+            stdout=b"",
+            stderr=b"[worker] stage=init\nfree(): invalid pointer\n",
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+
+    text = str(e.value)
+    assert "Init()" in text
+    assert "every entry will fail the same way" in text
+    assert "per-message" not in text
+
+
+def test_a_death_during_decrypt_is_named_as_per_message(monkeypatch):
+    """The inverse, so the two cannot collapse into one message again."""
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=-6,
+            stdout=b"",
+            stderr=(
+                b"[worker] stage=init\n[worker] stage=decrypt\n"
+                b"free(): invalid pointer\n"
+            ),
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+
+    text = str(e.value)
+    assert "DecryptData" in text
+    assert "per-message" in text
+    assert "every entry will fail" not in text
+
+
+def test_a_death_before_any_stage_blames_the_load(monkeypatch):
+    """No marker means it died in the library load, before `Init()` was reached."""
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=-6, stdout=b"", stderr=b"free(): invalid pointer\n"
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+    assert "before announcing a stage" in str(e.value)
+
+
+def test_a_stage_marker_survives_a_noisy_child(monkeypatch):
+    """glibc prints its reason AFTER the marker, and a chatty child can easily
+    exceed the display window — so the stage must be read from the whole of
+    stderr, not from the tail that gets shown."""
+    from app.adapters import sdk_process as sp
+
+    noisy = b"[worker] stage=init\n" + b"x" * (sp.STDERR_TAIL * 2)
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=-6, stdout=b"", stderr=noisy
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+    assert "Init()" in str(e.value)
+
+
+def test_the_worker_announces_each_stage_before_the_native_call(monkeypatch):
+    """Pins the ORDER, which is the whole diagnostic value.
+
+    `decrypt()` calls `load()` internally, so without an explicit marker the
+    `stage=decrypt` label would also cover the initialisation — and a credential
+    fault would be reported as an unreadable message.
+    """
+    import types
+
+    from app.adapters import sdk_worker
+
+    events: list[str] = []
+
+    class FakeSdk:
+        path = ""
+
+        def load(self):
+            events.append("load")
+
+        def decrypt(self, key, msg):
+            events.append("decrypt")
+            return '{"msgtype":"text"}'
+
+    fake = types.ModuleType("app.adapters.wework_sdk")
+    fake.SdkLibraryError = RuntimeError
+    fake.get_sdk = lambda: FakeSdk()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.adapters.wework_sdk", fake)
+    monkeypatch.setattr(sdk_worker, "_stage", lambda name: events.append(f"stage:{name}"))
+
+    reply = sdk_worker.handle(
+        {"op": "decrypt", "key_b64": base64.b64encode(b"k").decode(), "msg": "m"}
+    )
+
+    assert reply == {"ok": True, "text": '{"msgtype":"text"}'}
+    assert events == ["stage:init", "load", "stage:decrypt", "decrypt"]
+
+
 def test_the_worker_process_speaks_the_protocol():
     """The REAL child, with no `.so` involved.
 
@@ -863,6 +991,120 @@ def test_get_chat_data_counts_the_entries_it_could_not_decrypt(monkeypatch):
             ),
         },
     }
+
+
+def test_is_global_fault_separates_init_deaths_from_message_deaths():
+    """The classification the poller breaks on, and its exact boundary.
+
+    A global fault fails every entry identically, so retrying is pure waste: one
+    doomed worker per entry and one identical ERROR per entry, which is what made
+    a live gateway look broken. A `DecryptData` death is per-message, so the
+    entries behind it may well be readable and the batch must continue.
+    """
+    from app.adapters.sdk_process import (
+        DEATH_DECRYPT,
+        DEATH_INIT,
+        DEATH_PRELOAD,
+        is_global_fault,
+    )
+
+    assert is_global_fault(f"DecryptError: {DEATH_INIT} — ...")
+    assert is_global_fault(f"DecryptError: {DEATH_PRELOAD} — ...")
+    assert is_global_fault("DecryptError: Init() failed: 10009 (ip非法)")
+
+    assert not is_global_fault(f"DecryptError: {DEATH_DECRYPT} — ...")
+    assert not is_global_fault("DecryptError: RSA decrypt failed: bad padding")
+    assert not is_global_fault("")
+
+
+def test_get_chat_data_stops_at_the_first_global_fault(monkeypatch):
+    """One doomed worker, not one per entry.
+
+    With the SDK isolated, a global fault costs a process spawn per entry. Over a
+    19-entry archive that is 19 aborts and 19 identical ERROR lines for a single
+    cause — a log flood that reads as "everything is broken" and hides the one
+    thing worth reading. The cursor still holds on the first unreadable seq, so
+    stopping early skips nothing.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = (
+                '{"errcode":0,"chatdata":['
+                '{"seq":1,"msgid":"m1","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="},'
+                '{"seq":2,"msgid":"m2","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="},'
+                '{"seq":3,"msgid":"m3","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="}]}'
+            )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    from app.adapters.sdk_process import DEATH_INIT
+
+    attempts: list[int] = []
+
+    def boom(raw, *_args, **_kwargs):
+        attempts.append(raw.get("seq"))
+        raise DecryptError(f"the SDK worker died during Init() — {DEATH_INIT}")
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+    monkeypatch.setattr("app.adapters.decrypt.decrypt_entry", boom)
+
+    api = wa.RealWeComApi()
+    assert api.get_chat_data(seq=0, limit=10, timeout=5) == []
+
+    assert attempts == [1], "the batch continued past a fault that dooms every entry"
+    assert api.last_pull_stats["decrypt_failed"] == 1
+    assert api.last_pull_stats["failed_seqs"] == [1]
+    assert api.last_pull_stats["raw_count"] == 3
+
+
+def test_get_chat_data_keeps_going_after_a_per_message_fault(monkeypatch):
+    """The other side of the boundary. A message-shaped fault must NOT stop the
+    batch, or one unreadable entry would hide every readable entry behind it."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = (
+                '{"errcode":0,"chatdata":['
+                '{"seq":1,"msgid":"m1","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="},'
+                '{"seq":2,"msgid":"m2","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="}]}'
+            )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    attempts: list[int] = []
+
+    def boom(raw, *_args, **_kwargs):
+        attempts.append(raw.get("seq"))
+        raise DecryptError("the SDK worker died during DecryptData — per-message")
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+    monkeypatch.setattr("app.adapters.decrypt.decrypt_entry", boom)
+
+    api = wa.RealWeComApi()
+    api.get_chat_data(seq=0, limit=10, timeout=5)
+
+    assert attempts == [1, 2]
+    assert api.last_pull_stats["failed_seqs"] == [1, 2]
 
 
 def test_get_permit_user_list_uses_the_msgaudit_namespace(monkeypatch):

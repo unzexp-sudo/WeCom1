@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import signal
 import subprocess
 import sys
@@ -24,9 +25,44 @@ from app.core.config import REPO_ROOT
 DEFAULT_TIMEOUT = 60.0
 STDERR_TAIL = 400
 
+# Stable, matchable names for where a worker died. `app/services/archive.py`
+# matches on these to choose the health hint, and they are constants rather than
+# inline prose on purpose: a hint that misreads the cause is worse than no hint,
+# because it sends the operator to fix the wrong thing. Telling someone to
+# re-upload a key when the child actually aborted in `Init()` costs a full round
+# trip, and that has already happened here more than once.
+DEATH_INIT = "the SDK worker died during Init()"
+DEATH_DECRYPT = "the SDK worker died during DecryptData"
+DEATH_PRELOAD = "the SDK worker died before announcing a stage"
+
+_DEATH_LEAD = {"init": DEATH_INIT, "decrypt": DEATH_DECRYPT}
+
+# What a death at each stage means. The distinction decides the fix: an `Init()`
+# death is global and fails every entry identically, while a `DecryptData` death
+# is per-message and leaves the rest of the archive readable.
+_DEATH_MEANING = {
+    DEATH_INIT: (
+        " — a credential or library-load fault, so every entry will fail the same "
+        "way and no key change will help"
+    ),
+    DEATH_DECRYPT: (
+        " — per-message, so only entries shaped like this one are affected, and the "
+        "library aborted rather than returning an error code"
+    ),
+    DEATH_PRELOAD: (
+        " — the library itself failed to load, before any call was made"
+    ),
+}
+
 
 class SdkWorkerError(RuntimeError):
     pass
+
+
+# The child announces each native call on stderr before making it
+# (`sdk_worker._stage`), because an abort kills it before any reply is written —
+# the marker is the only surviving evidence of where it died.
+_STAGE_RE = re.compile(r"\[worker\] stage=(\w+)")
 
 
 def _signal_name(number: int) -> str:
@@ -36,19 +72,57 @@ def _signal_name(number: int) -> str:
         return f"signal {number}"
 
 
+def _last_stage(stderr: bytes) -> str | None:
+    """The last stage the child announced, or None if it died before the first.
+
+    Searches the whole of stderr, not the tail: glibc prints its abort reason
+    *after* the marker, so a long tail can push the marker out of the window.
+    """
+    text = (stderr or b"").decode("utf-8", errors="replace")
+    found = _STAGE_RE.findall(text)
+    return found[-1] if found else None
+
+
+def death_kind(stderr: bytes) -> str:
+    """Which of the three death names applies to this child's stderr.
+
+    Exposed because the poller needs the same answer the message carries: an
+    `Init()` death is global, so retrying the remaining entries would spawn one
+    doomed process each and print the same ERROR per entry. See
+    `app/services/wecom_api.get_chat_data`.
+    """
+    return _DEATH_LEAD.get(_last_stage(stderr) or "", DEATH_PRELOAD)
+
+
+# Faults that make EVERY remaining entry fail identically. Retrying them spawns
+# one doomed worker per entry and prints one identical ERROR per entry — which
+# reads as a flood and buries the single real cause.
+_GLOBAL_FAULTS = (DEATH_INIT, DEATH_PRELOAD, "Init() failed")
+
+
+def is_global_fault(error: str) -> bool:
+    """Whether this failure means the rest of the batch is doomed too.
+
+    `DecryptData` deaths are deliberately absent: those are per-message, and the
+    entries behind them may well be readable.
+    """
+    return any(marker in (error or "") for marker in _GLOBAL_FAULTS)
+
+
 def _describe_death(returncode: int, stderr: bytes) -> str:
     detail = (stderr or b"").decode("utf-8", errors="replace").strip()
     tail = f" Worker stderr: {detail[-STDERR_TAIL:]}" if detail else ""
+
+    lead = death_kind(stderr)
     if returncode < 0:
-        return (
-            f"the SDK worker was killed by {_signal_name(-returncode)} — the vendor "
-            "library aborted its own process. The gateway is unaffected and this "
-            "entry is unreadable; the cursor is held, so nothing is lost."
-            + tail
+        how = (
+            f"the vendor library aborted its own process ({_signal_name(-returncode)}); "
+            "the gateway is unaffected and the cursor is held, so nothing is lost"
         )
-    return (
-        f"the SDK worker exited with code {returncode} before answering." + tail
-    )
+    else:
+        how = f"it exited with code {returncode} without answering"
+
+    return f"{lead}{_DEATH_MEANING[lead]}. {how}.{tail}"
 
 
 def run_decrypt(
