@@ -499,11 +499,24 @@ def ingest_entry(db, entry: dict, *, erp=None, api=None, storage=None) -> Ingest
             # is indistinguishable from "the message never arrived". The
             # customer sees silence; the operator sees a row with no reason.
             raw = norm.get("raw") if isinstance(norm.get("raw"), dict) else {}
-            sent_type = (raw.get("msgtype") or "").strip() or None
+            # An app-callback envelope loses its original type the moment it is
+            # mapped onto the archive shape; `app_msgtype`/`app_event` are what
+            # `_from_app_callback` preserves so this reason can name it. Without
+            # them a `change_external_contact` event — someone adding a customer,
+            # not sending an order — reads identically to an archive entry WeCom
+            # declined to type, and both read as "other".
+            sent_type = (raw.get("app_msgtype") or raw.get("msgtype") or "").strip() or None
+            sent_event = (raw.get("app_event") or "").strip() or None
+            if sent_event:
+                described = f"app-callback event {sent_event!r}"
+            elif sent_type:
+                described = f"msgtype {sent_type!r}"
+            else:
+                described = None
             reason = (
-                f"unsupported msgtype {sent_type!r} — this build routes only "
-                "text, image, file, voice and mixed; nothing was sent to the ERP"
-                if sent_type
+                f"unsupported {described} — this build routes only text, image, "
+                "file, voice and mixed; nothing was sent to the ERP"
+                if described
                 else "archive entry carried no msgtype field; nothing was sent "
                 "to the ERP"
             )

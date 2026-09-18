@@ -191,22 +191,42 @@ def pull_once(db, *, api=None, erp=None) -> dict:
     # orders), but "failed" is not — advancing past it would drop the order
     # permanently, and the batch would still report success.
     #
+    # An entry that could not be DECRYPTED is the same hazard and is easy to
+    # miss: it never appears in `entries` at all, so `seqs` does not hold its
+    # seq and `max(seqs)` would step straight over it. The archive keeps only 5
+    # days, so an entry the cursor walked past is an order lost for good. That
+    # is why the adapter reports the seqs it could not read, and why they are
+    # folded into the same hold.
+    #
     # Trade-off: a persistently failing entry blocks the cursor (head-of-line).
     # That is deliberate — §4.8 "never lose the message"; operators clear it
     # with POST /wecom/messages/{id}/rehand, which re-downloads the attachment
     # if that is what failed, and then re-runs the handoff. (It has to do both:
     # for a download failure the handoff alone changes nothing, because there is
     # no file_url to send and the entry is re-fetched identically on every pull.)
-    if failed_seqs:
-        blocked_at = min(failed_seqs)
+    undecryptable_seqs: list[int] = []
+    for value in stats.get("failed_seqs") or []:
+        try:
+            seq_value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if seq_value:
+            undecryptable_seqs.append(seq_value)
+
+    blockers = failed_seqs + undecryptable_seqs
+    if blockers:
+        blocked_at = min(blockers)
         safe = [s for s in seqs if s < blocked_at]
         max_seq = max([start_seq] + safe)
         logger.error(
-            "Archive cursor held at seq=%s: %s entr(ies) failed ingest, first "
-            "at seq=%s. Re-pull will retry them.",
+            "Archive cursor held at seq=%s: %s entr(ies) did not reach a terminal "
+            "state (first at seq=%s; %s failed ingest, %s could not be decrypted). "
+            "Re-pull will retry them.",
             max_seq,
-            len(failed_seqs),
+            len(blockers),
             blocked_at,
+            len(failed_seqs),
+            len(undecryptable_seqs),
         )
     else:
         max_seq = max([start_seq] + seqs)
@@ -227,14 +247,18 @@ def pull_once(db, *, api=None, erp=None) -> dict:
             "WECOM_ARCHIVE_PRIVATE_KEY_B64 / WECOM_ARCHIVE_PRIVATE_KEY_PATH "
             "holds the private half of the key pair whose public key is "
             "currently set on the Message Archiving page, and look for "
-            "'Archive decryption failed' in the gateway logs."
+            "'Archive decryption failed' in the gateway logs. The cursor is "
+            "being held, so nothing is lost while you fix it — but nothing "
+            "arrives either."
         )
     elif decrypt_failed:
         hint = (
             f"{decrypt_failed} of {raw_count} archived entr(ies) failed to "
             "decrypt and were skipped; the rest were ingested. A partial "
             "failure usually means the public key was regenerated on the "
-            "Message Archiving page partway through this window."
+            "Message Archiving page partway through this window. The cursor is "
+            "held below the first unreadable entry, so the entries behind it "
+            "are retried rather than stepped over."
         )
 
     logger.info(

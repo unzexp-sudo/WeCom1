@@ -101,6 +101,66 @@ def test_app_callback_text_reaches_the_erp(client, db, monkeypatch):
     assert row.external_userid == "wmExtCanteen001"
 
 
+def test_app_callback_event_keeps_what_actually_arrived():
+    """Regression: an `event` envelope became an anonymous "other" row.
+
+    WeCom delivers `change_external_contact` — someone ADDED a customer, which
+    is not an order — with `MsgType: "event"` and no `MsgId`. It fell outside
+    the type map, collapsed to "other", and the original type was discarded. So
+    the row could only report msgtype "other", msgid null and an empty tolist,
+    which is ALSO what an archive entry WeCom declined to type looks like. The
+    two were indistinguishable, and "you added a customer" was read live as
+    "the archive delivered nothing".
+    """
+    entry = _from_app_callback(
+        {
+            "ToUserName": "wwCorpId",
+            "FromUserName": "LiZheng",
+            "CreateTime": 1789642867,
+            "MsgType": "event",
+            "Event": "change_external_contact",
+            "ChangeType": "add_external_contact",
+            "ExternalUserID": "wmExtCustomer001",
+            "AgentID": "1000002",
+        }
+    )
+    # Routing is unchanged: an event is still not a routable message.
+    assert entry["msgtype"] == "other"
+    # But what arrived is now recoverable.
+    assert entry["app_msgtype"] == "event"
+    assert entry["app_event"] == "change_external_contact"
+    assert entry["msgid"] is None
+    assert entry["tolist"] == []
+
+
+def test_an_app_callback_event_is_ignored_by_name(client, db, monkeypatch):
+    """The ignore must name the event, not just say "other"."""
+    from app.adapters.erp_client import MockErpClient
+
+    monkeypatch.setattr("app.adapters.erp_client.get_erp_client", MockErpClient)
+
+    r = client.post(
+        "/wecom/callback",
+        json={
+            "ToUserName": "wwCorpId",
+            "FromUserName": "LiZheng",
+            "CreateTime": 1789642867,
+            "MsgType": "event",
+            "Event": "change_external_contact",
+            "ChangeType": "add_external_contact",
+            "ExternalUserID": "wmExtCustomer001",
+            "AgentID": "1000002",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    row = db.query(WeComMessageLog).one()
+    assert row.status == "ignored"
+    assert row.error is not None, "an ignored event must say why"
+    assert "change_external_contact" in row.error
+    assert row.msgtype == "other"
+
+
 # ---------------------------------------------------------------------------
 # 2. Attachment captions survive
 # ---------------------------------------------------------------------------

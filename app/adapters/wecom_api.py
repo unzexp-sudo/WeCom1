@@ -179,7 +179,7 @@ class MockWeComApi:
         self.sent: list[dict[str, Any]] = []
         # Filled by `get_chat_data`. See `RealWeComApi.get_chat_data` — the mock
         # publishes it too so both adapters answer the same questions.
-        self.last_pull_stats: dict[str, int] = {}
+        self.last_pull_stats: dict[str, Any] = {}
 
     def get_access_token(self) -> str:
         return "mock-access-token"
@@ -196,7 +196,11 @@ class MockWeComApi:
                 entries.append(data)
         entries.sort(key=lambda e: int(e.get("seq", 0)))
         entries = entries[:limit]
-        self.last_pull_stats = {"raw_count": len(entries), "decrypt_failed": 0}
+        self.last_pull_stats = {
+            "raw_count": len(entries),
+            "decrypt_failed": 0,
+            "failed_seqs": [],
+        }
         return entries
 
     def get_permit_user_list(self) -> list[str]:
@@ -269,7 +273,7 @@ class RealWeComApi:
         # Filled by `get_chat_data`: how many entries WeCom returned, and how
         # many of those we could not decrypt. Read by `archive.pull_once` via
         # `getattr`, so adapters and test fakes that predate it still work.
-        self.last_pull_stats: dict[str, int] = {}
+        self.last_pull_stats: dict[str, Any] = {}
 
     # --- token -------------------------------------------------------------
 
@@ -338,7 +342,9 @@ class RealWeComApi:
         out: list[dict[str, Any]] = []
         decrypt_failed = 0
         first_error: str | None = None
+        failed_seqs: list[int] = []
         for raw in chatdata:
+            envelope = raw if isinstance(raw, dict) else {}
             try:
                 entry = decrypt_entry(raw, decryptor)
             except Exception as exc:  # noqa: BLE001 - one bad entry must not stop the batch
@@ -347,17 +353,30 @@ class RealWeComApi:
                     first_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Failed to decrypt archive entry seq=%s: %s",
-                    raw.get("seq") if isinstance(raw, dict) else None,
+                    envelope.get("seq"),
                     exc,
                 )
+                # An entry we cannot read must not let the cursor walk past it.
+                # It never reaches `entries`, so `pull_once` cannot see its seq
+                # unless it is published here — and the archive keeps only 5
+                # days, so a seq the cursor stepped over is an order lost for
+                # good. Counted separately from `decrypt_failed` because a
+                # failure with no seq can be reported but not held.
+                try:
+                    bad_seq = int(envelope.get("seq") or 0)
+                except (TypeError, ValueError):
+                    bad_seq = 0
+                if bad_seq:
+                    failed_seqs.append(bad_seq)
                 continue
-            entry.setdefault("seq", raw.get("seq"))
-            entry.setdefault("msgid", raw.get("msgid"))
+            entry.setdefault("seq", envelope.get("seq"))
+            entry.setdefault("msgid", envelope.get("msgid"))
             out.append(entry)
 
         self.last_pull_stats = {
             "raw_count": len(chatdata),
             "decrypt_failed": decrypt_failed,
+            "failed_seqs": failed_seqs,
         }
         if decrypt_failed:
             logger.error(

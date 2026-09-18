@@ -164,6 +164,17 @@ def _from_app_callback(payload: dict[str, Any]) -> dict[str, Any]:
         # Customers routinely caption an attachment ("请按PDF下单").
         if content:
             entry["text"] = {"content": content}
+
+    if archived == "other":
+        # `other` is the collapse of everything the map above does not know: a
+        # location pin, a link card, and an `event` envelope all land here, and
+        # the entry is then ignored downstream. Preserve what actually arrived.
+        # Without it the row can only say "other" — unactionable — and once the
+        # original is gone an app-callback envelope is indistinguishable from an
+        # archive entry WeCom itself refused to type, which is the difference
+        # between "our mapping is incomplete" and "WeCom is not archiving".
+        entry["app_msgtype"] = msgtype or None
+        entry["app_event"] = (payload.get("Event") or "").strip() or None
     return entry
 
 

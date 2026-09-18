@@ -119,6 +119,91 @@ def test_pull_once_separates_an_empty_archive_from_a_decryption_failure(db):
     assert "console" not in summary["hint"].lower()
 
 
+def test_an_undecryptable_entry_holds_the_cursor(db, mock_erp):
+    """Regression: the cursor walked straight over entries it could not read.
+
+    An entry that fails to decrypt never reaches `entries`, so its seq is not in
+    `seqs` and `max(seqs)` steps over it. The archive keeps only 5 days, so a
+    seq the cursor passed is an order lost for good — and the batch still
+    reported success. The adapter publishes the seqs it could not read; the
+    cursor must hold below the lowest of them.
+    """
+
+    class _OneBadInTheMiddle:
+        """WeCom returned seq 1..3; seq 2 could not be decrypted."""
+
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 3,
+                "decrypt_failed": 1,
+                "failed_seqs": [2],
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return [
+                {
+                    "seq": 1,
+                    "msgid": "wmHold0001",
+                    "msgtype": "text",
+                    "from": "wmExtCanteen001",
+                    "tolist": ["wmExtCanteen001"],
+                    "text": {"content": "土豆 50斤"},
+                },
+                {
+                    "seq": 3,
+                    "msgid": "wmHold0003",
+                    "msgtype": "text",
+                    "from": "wmExtCanteen001",
+                    "tolist": ["wmExtCanteen001"],
+                    "text": {"content": "大米 10斤"},
+                },
+            ]
+
+    summary = archive.pull_once(db, api=_OneBadInTheMiddle(), erp=mock_erp)
+
+    assert summary["raw_count"] == 3
+    assert summary["decrypt_failed"] == 1
+    # seq 3 WAS read and ingested — but the cursor must not step over seq 2,
+    # because nothing will ever re-offer it once 5 days have passed.
+    assert summary["last_seq"] == 1
+
+
+def test_a_pull_with_nothing_unreadable_still_advances(db, mock_erp):
+    """The hold must not fire on a clean batch — that would stall the poller."""
+
+    class _AllGood:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 2,
+                "decrypt_failed": 0,
+                "failed_seqs": [],
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return [
+                {
+                    "seq": 1,
+                    "msgid": "wmAdv0001",
+                    "msgtype": "text",
+                    "from": "wmExtCanteen001",
+                    "tolist": ["wmExtCanteen001"],
+                    "text": {"content": "土豆 50斤"},
+                },
+                {
+                    "seq": 2,
+                    "msgid": "wmAdv0002",
+                    "msgtype": "text",
+                    "from": "wmExtCanteen001",
+                    "tolist": ["wmExtCanteen001"],
+                    "text": {"content": "大米 10斤"},
+                },
+            ]
+
+    summary = archive.pull_once(db, api=_AllGood(), erp=mock_erp)
+
+    assert summary["last_seq"] == 2
+
+
 def test_pull_once_claims_no_decryption_failure_when_the_adapter_is_silent(db):
     """An adapter that predates `last_pull_stats` (or a test fake) must not be
     reported as having decryption failures it never mentioned."""

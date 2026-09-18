@@ -387,8 +387,13 @@ def test_get_chat_data_counts_the_entries_it_could_not_decrypt(monkeypatch):
 
     # Nothing survived, so the caller sees an empty list...
     assert entries == []
-    # ...but the adapter says WHY, which is the whole point.
-    assert api.last_pull_stats == {"raw_count": 2, "decrypt_failed": 2}
+    # ...but the adapter says WHY, which is the whole point. `failed_seqs` is
+    # what stops the cursor stepping over an entry nobody could read.
+    assert api.last_pull_stats == {
+        "raw_count": 2,
+        "decrypt_failed": 2,
+        "failed_seqs": [1, 2],
+    }
 
 
 def test_get_permit_user_list_uses_the_msgaudit_namespace(monkeypatch):
