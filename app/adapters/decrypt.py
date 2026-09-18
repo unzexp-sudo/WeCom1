@@ -208,3 +208,51 @@ def private_key_fingerprint(
     )
     fingerprint = base64.b64encode(hashlib.sha256(der).digest()).decode()
     return fingerprint[:16], getattr(key, "key_size", None), None
+
+
+def probe_entry_shape(entry: dict[str, Any]) -> dict[str, Any]:
+    """Structural facts about an entry that would not decrypt. Never a value.
+
+    Every entry that fails to decrypt reports the same thing — `decrypt_failed:
+    N` — while the causes are unrelated, and at least one of them is invisible
+    from the outside:
+
+    - **A ciphertext whose length is not a whole number of AES blocks.** This is
+      *independent of the key*: it is a property of the bytes WeCom handed back.
+    - **A field that is missing or not base64 at all** (a different envelope
+      shape than the one we parse).
+    - **The wrong key**, which does NOT raise: OpenSSL 3.2+ implements implicit
+      rejection for RSA PKCS#1 v1.5, so `RSAPrivateKey.decrypt` returns
+      pseudorandom bytes instead of failing. The AES layer then raises something
+      unrelated-looking, or `_pkcs7_unpad` does.
+
+    Because the last one is silent, "the RSA step succeeded, so the key must
+    match" is a **false inference** — do not make it. Measure the shape instead.
+
+    Lengths, field names and `publickey_ver` only: no ciphertext, no key, no
+    decrypted content. Safe to publish on a health endpoint.
+    """
+    def _decoded_len(value: Any) -> int | str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return len(base64.b64decode(value))
+        except (binascii.Error, ValueError):
+            return "not-base64"
+
+    random_key = entry.get("encrypt_random_key")
+    chat_msg = entry.get("encrypt_chat_msg")
+    msg_len = _decoded_len(chat_msg)
+
+    return {
+        "keys_present": sorted(entry),
+        "publickey_ver": entry.get("publickey_ver"),
+        "seq": entry.get("seq"),
+        "encrypt_random_key_b64_chars": len(random_key) if isinstance(random_key, str) else None,
+        "encrypt_random_key_bytes": _decoded_len(random_key),
+        "encrypt_chat_msg_b64_chars": len(chat_msg) if isinstance(chat_msg, str) else None,
+        "encrypt_chat_msg_bytes": msg_len,
+        # The tell for the key-independent failure: a non-zero remainder here
+        # cannot be fixed by changing the key.
+        "encrypt_chat_msg_mod16": msg_len % 16 if isinstance(msg_len, int) else None,
+    }

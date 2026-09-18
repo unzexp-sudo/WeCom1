@@ -304,7 +304,7 @@ class RealWeComApi:
     # --- archive -----------------------------------------------------------
 
     def get_chat_data(self, seq: int, limit: int, timeout: int) -> list[dict[str, Any]]:
-        from app.adapters.decrypt import decrypt_entry, get_decryptor
+        from app.adapters.decrypt import decrypt_entry, get_decryptor, probe_entry_shape
 
         with _client() as c:
             r = c.post(
@@ -342,6 +342,7 @@ class RealWeComApi:
         out: list[dict[str, Any]] = []
         decrypt_failed = 0
         first_error: str | None = None
+        first_shape: dict[str, Any] | None = None
         failed_seqs: list[int] = []
         for raw in chatdata:
             envelope = raw if isinstance(raw, dict) else {}
@@ -351,6 +352,10 @@ class RealWeComApi:
                 decrypt_failed += 1
                 if first_error is None:
                     first_error = f"{type(exc).__name__}: {exc}"
+                    # Measure the FIRST failure only: the shape is a property of
+                    # the batch, and one probe per pull is enough to tell a
+                    # ciphertext-length fault from a wrong key.
+                    first_shape = probe_entry_shape(envelope)
                 logger.warning(
                     "Failed to decrypt archive entry seq=%s: %s",
                     envelope.get("seq"),
@@ -383,6 +388,10 @@ class RealWeComApi:
             # match the modulus) versus the key is not USABLE AT ALL (unreadable
             # PEM, truncated base64). Carry it out of the adapter.
             "first_error": first_error,
+            # ...and the shape, because a wrong key does NOT raise: OpenSSL 3.2+
+            # implicitly rejects a bad PKCS#1 v1.5 padding and returns
+            # pseudorandom bytes, so "the RSA step passed" proves nothing.
+            "first_error_shape": first_shape,
         }
         if decrypt_failed:
             logger.error(

@@ -293,6 +293,14 @@ def pull_once(db, *, api=None, erp=None) -> dict:
     # the container log to tell them apart.
     first_error = stats.get("first_error")
     suffix = f" First failure: {first_error}" if first_error else ""
+    # The shape matters as much as the exception, because a WRONG KEY DOES NOT
+    # RAISE: OpenSSL 3.2+ implicitly rejects a bad PKCS#1 v1.5 padding and hands
+    # back pseudorandom bytes, so the AES layer is what complains and "the RSA
+    # step passed" proves nothing about the key. A ciphertext length that is not
+    # a whole number of AES blocks is key-independent — no key will ever fix it.
+    first_shape = stats.get("first_error_shape")
+    if first_shape:
+        suffix += f" First entry shape: {first_shape}"
     if raw_count and not entries:
         hint = (
             f"WeCom returned {raw_count} archived entr(ies) and NONE could be "

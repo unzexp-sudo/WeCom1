@@ -319,6 +319,47 @@ def test_an_unusable_key_is_named_and_never_raises(tmpdir):
     assert "not found" in missing[2]
 
 
+def test_probe_entry_shape_reports_a_key_independent_fault():
+    """The probe must expose the fault that no key can fix.
+
+    A ciphertext whose length is not a whole number of AES blocks fails exactly
+    like a wrong key — same counters, same hint, same `decrypt_failed` — but
+    changing the key will never make it decrypt. Only the shape tells them apart.
+    """
+    from app.adapters.decrypt import probe_entry_shape
+
+    shape = probe_entry_shape(
+        {
+            "seq": 7,
+            "publickey_ver": 3,
+            "encrypt_random_key": base64.b64encode(b"k" * 256).decode(),
+            "encrypt_chat_msg": base64.b64encode(b"x" * 33).decode(),
+        }
+    )
+
+    assert shape["seq"] == 7
+    assert shape["publickey_ver"] == 3
+    assert shape["encrypt_random_key_bytes"] == 256
+    assert shape["encrypt_chat_msg_bytes"] == 33
+    # 33 is not a multiple of 16 — the RSA/AES key is NOT the cause.
+    assert shape["encrypt_chat_msg_mod16"] == 1
+
+
+def test_probe_entry_shape_survives_a_missing_or_unparseable_field():
+    """A different envelope shape must be REPORTED, never raised on."""
+    from app.adapters.decrypt import probe_entry_shape
+
+    shape = probe_entry_shape({"seq": 1, "encrypt_chat_msg": "!!!not base64!!!"})
+
+    assert shape["encrypt_chat_msg_bytes"] == "not-base64"
+    assert shape["encrypt_chat_msg_mod16"] is None
+    assert shape["encrypt_random_key_bytes"] is None
+    assert shape["encrypt_random_key_b64_chars"] is None
+    assert shape["keys_present"] == ["encrypt_chat_msg", "seq"]
+    # Lengths and names only — the ciphertext itself must not be echoed.
+    assert "!!!not base64!!!" not in str(shape)
+
+
 def test_http_clients_ignore_the_sandbox_proxy():
     """§2 — every outbound call must bypass the proxy env (loopback ERP)."""
     for factory in (wa._client, ec._client):
@@ -457,6 +498,16 @@ def test_get_chat_data_counts_the_entries_it_could_not_decrypt(monkeypatch):
         "decrypt_failed": 2,
         "failed_seqs": [1, 2],
         "first_error": "DecryptError: RSA decrypt failed: the key does not match this blob",
+        "first_error_shape": {
+            "keys_present": ["encrypt_chat_msg", "encrypt_random_key", "msgid", "seq"],
+            "publickey_ver": None,
+            "seq": 1,
+            "encrypt_random_key_b64_chars": 4,
+            "encrypt_random_key_bytes": 1,
+            "encrypt_chat_msg_b64_chars": 4,
+            "encrypt_chat_msg_bytes": 1,
+            "encrypt_chat_msg_mod16": 1,
+        },
     }
 
 
