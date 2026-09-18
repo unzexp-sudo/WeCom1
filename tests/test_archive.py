@@ -204,6 +204,45 @@ def test_a_pull_with_nothing_unreadable_still_advances(db, mock_erp):
     assert summary["last_seq"] == 2
 
 
+def test_pull_once_records_what_it_did_for_health(
+    db, mock_erp, mock_api, simulator_archive
+):
+    """The last pass must be reportable WITHOUT a secret.
+
+    "The poller is stuck" and "WeCom is returning nothing" both leave the message
+    count unchanged, so the counters from the most recent pass are the only thing
+    that tells them apart — and requiring `X-Gateway-Key` to read them is what
+    kept this ambiguous for days.
+    """
+    before = archive.last_pull_state()
+
+    archive.pull_once(db, api=mock_api, erp=mock_erp)
+
+    after = archive.last_pull_state()
+    assert after["pulls_total"] == before["pulls_total"] + 1
+    last = after["last_pull"]
+    assert last is not None
+    assert last["fetched"] == len(simulator_archive["entries"])
+    assert last["raw_count"] is not None
+    assert last["error"] is None
+    assert last["at"]
+
+
+def test_a_failed_pull_is_recorded_with_its_reason(db):
+    """The failure path must be recorded too — it is the one worth reading."""
+
+    class _Boom:
+        def get_chat_data(self, **kwargs):
+            raise RuntimeError("errcode 60020 not allow to access from your ip")
+
+    archive.pull_once(db, api=_Boom())
+
+    last = archive.last_pull_state()["last_pull"]
+    assert last is not None
+    assert last["error"] is not None
+    assert "60020" in last["error"]
+
+
 def test_pull_once_claims_no_decryption_failure_when_the_adapter_is_silent(db):
     """An adapter that predates `last_pull_stats` (or a test fake) must not be
     reported as having decryption failures it never mentioned."""

@@ -41,6 +41,45 @@ def test_health_reports_no_bot_surface(client):
     assert "bot" not in body
 
 
+def test_health_reports_where_the_pull_loop_is(client, db):
+    """The poller's state must be readable WITHOUT the gateway key.
+
+    "The poller is stuck" and "WeCom is returning nothing" both leave the message
+    count unchanged, so the counters from the most recent pass are the only thing
+    that separates them. Settling it used to mean pasting `X-Gateway-Key` into a
+    shell to call the guarded probe — which is friction on the one question that
+    matters during go-live.
+    """
+    from app.services import archive
+
+    state = client.get("/wecom/health").json()["archive"]
+    assert "cursor_seq" in state
+    assert "pulls_total" in state
+    assert "last_pull" in state
+
+    class _Empty:
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    archive.pull_once(db, api=_Empty())
+
+    state = client.get("/wecom/health").json()["archive"]
+    assert state["pulls_total"] >= 1
+    assert state["last_pull"] is not None
+    assert state["last_pull"]["fetched"] == 0
+    # Counters and a timestamp only — pinned so no message text, userid or
+    # secret can creep onto an unauthenticated endpoint later.
+    assert set(state["last_pull"]) == {
+        "at",
+        "fetched",
+        "raw_count",
+        "decrypt_failed",
+        "last_seq",
+        "error",
+        "hint",
+    }
+
+
 def test_health_reports_the_ingest_scope_gate(client, monkeypatch):
     assert client.get("/wecom/health").json()["config"]["ingest_only_order_groups"] is False
 

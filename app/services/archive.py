@@ -102,6 +102,51 @@ def set_cursor(db, cursor: WeComMessageCursor, last_seq: int) -> None:
         logger.exception("Failed to advance cursor %s to seq=%s", cursor.cursor_key, last_seq)
 
 
+_pull_lock = threading.Lock()
+_last_pull: dict[str, Any] = {}
+_pulls_total = 0
+
+
+def _record_pull(summary: dict[str, Any]) -> None:
+    """Remember the last pass so it can be reported without a secret.
+
+    The poller's output used to go only to the log, which made two opposite
+    situations identical from outside: **the poller is stuck** and **WeCom is
+    returning nothing** both leave the message count unchanged. Settling it meant
+    pasting `X-Gateway-Key` into a shell to call the guarded probe. Recording the
+    numbers makes `/wecom/health` answer it.
+
+    In-memory on purpose — these describe THIS process. `pulls_total` is what
+    keeps a null `last_pull` readable: it distinguishes "this container has not
+    pulled yet" from "nothing was ever recorded", which an in-memory field alone
+    cannot. Never let bookkeeping break a pull, hence the bare except at the end.
+    """
+    global _last_pull, _pulls_total
+    try:
+        with _pull_lock:
+            _pulls_total += 1
+            _last_pull = {
+                "at": utcnow().isoformat(timespec="seconds"),
+                "fetched": summary.get("fetched"),
+                "raw_count": summary.get("raw_count"),
+                "decrypt_failed": summary.get("decrypt_failed"),
+                "last_seq": summary.get("last_seq"),
+                "error": summary.get("error"),
+                "hint": summary.get("hint"),
+            }
+    except Exception:  # noqa: BLE001 - observability must never break the pull
+        logger.exception("Failed to record the last archive pull")
+
+
+def last_pull_state() -> dict[str, Any]:
+    """Snapshot for `/wecom/health`. Pure memory read — no I/O, no secrets."""
+    with _pull_lock:
+        return {
+            "pulls_total": _pulls_total,
+            "last_pull": dict(_last_pull) if _last_pull else None,
+        }
+
+
 def pull_once(db, *, api=None, erp=None) -> dict:
     """One archive pull. Returns {"fetched", "ingested", "skipped", "last_seq"}."""
     from app.services.ingestor import ingest_entry
@@ -126,7 +171,7 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         # failed" indistinguishable from "the archive has no new messages" — and
         # that is the exact question during go-live, where a wrong archive secret
         # or a rejected 可信IP both looked like a successful, empty pull.
-        return {
+        summary = {
             "fetched": 0,
             "ingested": 0,
             "skipped": 0,
@@ -137,6 +182,8 @@ def pull_once(db, *, api=None, erp=None) -> dict:
             "error": f"{type(exc).__name__}: {exc}",
             "hint": None,
         }
+        _record_pull(summary)
+        return summary
 
     entries = [e for e in (entries or []) if isinstance(e, dict)]
 
@@ -273,7 +320,7 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         decrypt_failed,
         max_seq,
     )
-    return {
+    summary = {
         "fetched": len(entries),
         "ingested": ingested,
         "skipped": skipped,
@@ -284,6 +331,8 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         "error": None,
         "hint": hint,
     }
+    _record_pull(summary)
+    return summary
 
 
 def start_poller(interval: int | None = None) -> threading.Thread:

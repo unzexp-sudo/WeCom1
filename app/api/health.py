@@ -41,9 +41,46 @@ def health(db: Session = Depends(get_db)) -> dict:
         "archive_enabled": bool(settings.archive_private_key_path or settings.archive_sdk_path),
         "contacts": contacts,
         "messages": messages,
+        "archive": _archive_state(db),
         "config": _config_readiness(),
         "time": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _archive_state(db: Session) -> dict:
+    """Where the pull loop actually IS, readable without a secret.
+
+    Two opposite situations look identical from the outside — the poller being
+    stuck, and WeCom returning nothing — because both leave the message count
+    unchanged. Until now the only way to tell them apart was to paste
+    `X-Gateway-Key` into a shell and call the guarded probe. `cursor_seq` plus the
+    last pass's counters settle it from the health endpoint instead.
+
+    Read-only (one indexed SELECT) and content-free: counters and a timestamp,
+    never a message, a userid or a secret. `pulls_total == 0` means this
+    container has not pulled yet — which is NOT the same as "nothing happened",
+    and is exactly why the counter is here.
+    """
+    from app.models.wecom import WeComMessageCursor
+    from app.services.archive import last_pull_state
+
+    try:
+        cursor = (
+            db.query(WeComMessageCursor)
+            .filter(WeComMessageCursor.cursor_key == "archive")
+            .one_or_none()
+        )
+        cursor_seq = int(cursor.last_seq or 0) if cursor else 0
+        last_run_at = (
+            cursor.last_run_at.isoformat()
+            if cursor is not None and cursor.last_run_at is not None
+            else None
+        )
+    except Exception as exc:  # noqa: BLE001 - health must always answer
+        logger.warning("Archive cursor unavailable: %s", exc)
+        cursor_seq, last_run_at = 0, None
+
+    return {"cursor_seq": cursor_seq, "last_run_at": last_run_at, **last_pull_state()}
 
 
 def _config_readiness() -> dict:
