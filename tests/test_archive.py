@@ -266,6 +266,72 @@ def test_the_hint_carries_the_first_decryption_error(db):
     assert "Ciphertext length" in summary["hint"]
 
 
+def test_a_block_unaligned_ciphertext_blames_the_provider_not_the_key(db):
+    """A total decryption failure has three causes that are identical from
+    outside the container, and this hint used to name the key for all of them.
+
+    When the decoded ciphertext is not a whole number of AES blocks, the fault is
+    in the BYTES: no key change can fix it, and the real cause is the `pure`
+    provider being unable to read the archive envelope. Sending the operator to
+    re-upload a public key costs a console round trip and fixes nothing, so the
+    measured shape has to select the sentence.
+    """
+
+    class _Unaligned:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 19,
+                "decrypt_failed": 19,
+                "failed_seqs": list(range(1, 20)),
+                "first_error": "ValueError: The length of the provided data is "
+                "not a multiple of the block length.",
+                "first_error_shape": {
+                    "encrypt_chat_msg_bytes": 327,
+                    "encrypt_chat_msg_mod16": 7,
+                },
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    hint = archive.pull_once(db, api=_Unaligned())["hint"]
+
+    assert "mod16=7" in hint
+    assert "WECOM_DECRYPT_PROVIDER=sdk" in hint
+    # The old hint's claim, which sent the operator to the console for nothing.
+    assert "key mismatch on THIS side" not in hint
+
+
+def test_a_block_aligned_ciphertext_still_blames_the_key(db):
+    """The other side of that branch. Without this, the fix above would have
+    swapped one unconditional wrong answer for another.
+
+    `mod16 == 0` is falsy, so an aligned ciphertext must fall through to the key
+    sentence — which is also what an unmeasurable shape does.
+    """
+
+    class _Aligned:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 2,
+                "decrypt_failed": 2,
+                "failed_seqs": [1, 2],
+                "first_error": "DecryptError: Invalid PKCS7 padding in archive payload",
+                "first_error_shape": {
+                    "encrypt_chat_msg_bytes": 336,
+                    "encrypt_chat_msg_mod16": 0,
+                },
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    hint = archive.pull_once(db, api=_Aligned())["hint"]
+
+    assert "WECOM_ARCHIVE_PRIVATE_KEY_PATH" in hint
+    assert "WECOM_DECRYPT_PROVIDER=sdk" not in hint
+
+
 def test_pull_once_claims_no_decryption_failure_when_the_adapter_is_silent(db):
     """An adapter that predates `last_pull_stats` (or a test fake) must not be
     reported as having decryption failures it never mentioned."""

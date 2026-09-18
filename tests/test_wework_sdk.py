@@ -191,6 +191,28 @@ def test_decrypt_returns_the_decrypted_text(fake):
     assert _sdk().decrypt("KEY", "MSG") == '{"msgid":"M1","msgtype":"text"}'
 
 
+def test_decrypt_does_not_need_an_authenticated_init(fake):
+    """`DecryptData` is static: no handle, no `Init()`, no network.
+
+    Requiring `Init()` here makes text decryption depend on an authenticated
+    round trip that cannot affect the result — and an `Init()` rejection then
+    looks *exactly* like a wrong key (every entry fails, `fetched: 0`), so the
+    hint points at the key while the real fault is the corp secret or the IP
+    allowlist. Regression guard for that misattribution.
+    """
+    _sdk().decrypt("KEY", "MSG")
+
+    assert not fake.named("Init"), "decrypt() authenticated via Init()"
+    assert not fake.named("NewSdk"), "decrypt() built an sdk handle it does not need"
+
+
+def test_decrypt_accepts_the_rsa_decrypted_key_as_bytes(fake):
+    """The RSA step yields bytes; a NUL-free C string is what the SDK wants."""
+    assert _sdk().decrypt(b"\x01\x02\x03", "MSG") is not None
+    (args,) = fake.named("DecryptData")
+    assert args[0] == b"\x01\x02\x03"
+
+
 def test_decrypt_reports_a_nonzero_code_with_its_hint(fake):
     fake._decrypt_rc = 10006
     with pytest.raises(ws.SdkLibraryError) as e:

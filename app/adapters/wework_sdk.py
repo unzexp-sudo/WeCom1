@@ -219,16 +219,33 @@ class WeWorkFinanceSdk:
 
     # --- operations -------------------------------------------------------
 
-    def decrypt(self, encrypt_random_key: str, encrypt_chat_msg: str) -> str:
-        """Decrypt one archive entry to JSON text."""
-        lib = self.load()
+    def decrypt(self, encrypt_key: str | bytes, encrypt_msg: str) -> str:
+        """Decrypt one archive entry to JSON text.
+
+        `encrypt_key` is the **RSA-decrypted** `encrypt_random_key` — the vendor
+        header is explicit ("使用企业自持对应版本秘钥RSA解密后的内容", and the C
+        sample repeats it), and the SDK *parses* what it is handed, so the base64
+        field from the pull response fails as code `10008 解析encrypt_key出错`.
+        `app.adapters.decrypt.rsa_decrypt_random_key` produces the right value.
+
+        Only `load_library()` is needed here, never `load()`. `DecryptData` is a
+        static function — its mangled symbol is
+        `WeWorkFinanceSdk::DecryptData(std::string const&, std::string const&,
+        std::string*)`, with no handle — so it does no authentication and no
+        network I/O. Calling `Init()` first would make text decryption depend on
+        an authenticated round trip that cannot affect the result, and an
+        `Init()` rejection would then surface as "every entry failed to decrypt":
+        the same symptom as a wrong key, with a hint pointing at the wrong cause.
+        """
+        lib = self.load_library()
         sl = lib.NewSlice()
         if not sl:
             raise SdkLibraryError("NewSlice() returned NULL")
         try:
+            key = encrypt_key.encode() if isinstance(encrypt_key, str) else encrypt_key
             rc = lib.DecryptData(
-                (encrypt_random_key or "").encode(),
-                (encrypt_chat_msg or "").encode(),
+                key or b"",
+                (encrypt_msg or "").encode(),
                 sl,
             )
             if rc != 0:

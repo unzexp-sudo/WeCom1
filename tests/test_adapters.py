@@ -360,6 +360,67 @@ def test_probe_entry_shape_survives_a_missing_or_unparseable_field():
     assert "!!!not base64!!!" not in str(shape)
 
 
+def test_rsa_decrypt_random_key_is_not_the_base64_field(tmpdir):
+    """The SDK's `encrypt_key` is the RSA-DECRYPTED field, not the field itself.
+
+    The vendor header calls the argument `encrypt_key` and the pull response
+    calls the field `encrypt_random_key`, so swapping them reads as correct.
+    The SDK then answers `10008 解析encrypt_key出错` — "error *parsing*
+    encrypt_key" — because it parses what it is handed rather than using it as a
+    key. That error name is the tell, and it is why this conversion is a named
+    function rather than an inline `b64decode`.
+    """
+    from app.adapters.decrypt import rsa_decrypt_random_key
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = _write_key(tmpdir / "k.pem", key)
+
+    secret = b"the-key-envelope-wecom-encrypts"
+    field = base64.b64encode(
+        key.public_key().encrypt(secret, asym_padding.PKCS1v15())
+    ).decode()
+
+    assert rsa_decrypt_random_key(field, str(pem)) == secret
+    # The two values are not interchangeable, and neither is a prefix of the other.
+    assert rsa_decrypt_random_key(field, str(pem)) != field.encode()
+
+
+def test_sdk_decryptor_does_the_rsa_step_the_binding_will_not(monkeypatch, tmpdir):
+    """`WeWorkFinanceSdk.decrypt` takes the already-decrypted key, on purpose —
+    it mirrors the vendor signature. So the RSA conversion has to happen in
+    `SdkDecryptor`, and nothing else does it. Without this the SDK receives a
+    344-character base64 blob instead of a key envelope and answers 10008."""
+    from app.adapters import decrypt as dec
+    from app.adapters import wework_sdk as wws
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = _write_key(tmpdir / "k.pem", key)
+    monkeypatch.setattr(dec.settings, "archive_private_key_path", str(pem))
+
+    seen: dict[str, object] = {}
+
+    class _Sdk:
+        path = ""
+
+        def decrypt(self, encrypt_key, encrypt_msg):
+            seen["encrypt_key"] = encrypt_key
+            seen["encrypt_msg"] = encrypt_msg
+            return '{"msgtype":"text","text":{"content":"hi"}}'
+
+    monkeypatch.setattr(wws, "get_sdk", lambda: _Sdk())
+
+    secret = b"key-envelope"
+    field = base64.b64encode(
+        key.public_key().encrypt(secret, asym_padding.PKCS1v15())
+    ).decode()
+
+    out = dec.SdkDecryptor().decrypt(field, "CIPHERTEXT")
+
+    assert out == '{"msgtype":"text","text":{"content":"hi"}}'
+    assert seen["encrypt_key"] == secret, "the SDK was given the undecrypted field"
+    assert seen["encrypt_msg"] == "CIPHERTEXT"
+
+
 def test_http_clients_ignore_the_sandbox_proxy():
     """§2 — every outbound call must bypass the proxy env (loopback ERP)."""
     for factory in (wa._client, ec._client):

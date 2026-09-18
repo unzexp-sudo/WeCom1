@@ -302,26 +302,49 @@ def pull_once(db, *, api=None, erp=None) -> dict:
     if first_shape:
         suffix += f" First entry shape: {first_shape}"
     if raw_count and not entries:
+        # The hint must name the ONE cause that fits the measured shape, because
+        # every total-failure cause is identical from outside the container:
+        # `fetched: 0` with a healthy `raw_count`. Three unrelated faults land
+        # here — the wrong key, an unusable key, and a decrypt provider that
+        # cannot read the archive envelope at all — and they need different
+        # fixes. An earlier version of this hint named the key unconditionally,
+        # and sent the operator to re-upload a public key that was never wrong.
+        shape_mod16 = (first_shape or {}).get("encrypt_chat_msg_mod16")
+        if shape_mod16:
+            cause = (
+                "The first entry decodes to a length that is not a whole number "
+                f"of AES blocks (mod16={shape_mod16}), which is a property of the "
+                "BYTES and not of the key — no key change can fix it. This is the "
+                "expected result of WECOM_DECRYPT_PROVIDER=pure: encrypt_chat_msg "
+                "is not base64 ciphertext but a structured envelope (a "
+                "13-character prefix, a 32-character key slice, then the payload "
+                "at a protobuf-derived offset), and only WeCom's own DecryptData "
+                "parses it. Set WECOM_DECRYPT_PROVIDER=sdk. "
+            )
+        else:
+            cause = (
+                "The measured shape is consistent with a key fault, so check that "
+                "WECOM_ARCHIVE_PRIVATE_KEY_B64 / WECOM_ARCHIVE_PRIVATE_KEY_PATH "
+                "holds the private half of the key pair whose public key is "
+                "currently set on the Message Archiving page. "
+            )
         hint = (
             f"WeCom returned {raw_count} archived entr(ies) and NONE could be "
             f"decrypted (decrypt_failed={decrypt_failed}). This is NOT an empty "
-            "archive, and NOT a consent or public-key problem on the WeCom side "
-            "— it is a key mismatch on THIS side. Check that "
-            "WECOM_ARCHIVE_PRIVATE_KEY_B64 / WECOM_ARCHIVE_PRIVATE_KEY_PATH "
-            "holds the private half of the key pair whose public key is "
-            "currently set on the Message Archiving page, and look for "
-            "'Archive decryption failed' in the gateway logs. The cursor is "
-            "being held, so nothing is lost while you fix it — but nothing "
-            "arrives either."
+            "archive, and NOT a consent problem on the WeCom side. "
+            + cause
+            + "The cursor is being held, so nothing is lost while you fix it — "
+            "but nothing arrives either."
         ) + suffix
     elif decrypt_failed:
         hint = (
             f"{decrypt_failed} of {raw_count} archived entr(ies) failed to "
-            "decrypt and were skipped; the rest were ingested. A partial "
-            "failure usually means the public key was regenerated on the "
-            "Message Archiving page partway through this window. The cursor is "
-            "held below the first unreadable entry, so the entries behind it "
-            "are retried rather than stepped over."
+            "decrypt and were skipped; the rest were ingested. A partial failure "
+            "means those entries alone are unreadable — usually a public key that "
+            "was regenerated on the Message Archiving page partway through this "
+            "window, or an entry whose type the current provider cannot handle. "
+            "The cursor is held below the first unreadable entry, so the entries "
+            "behind it are retried rather than stepped over."
         ) + suffix
 
     logger.info(
