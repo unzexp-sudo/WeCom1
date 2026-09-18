@@ -29,6 +29,13 @@ HANDOFF_KEYS = {
     "file_url",
     "file_path",
     "file_mime",
+    # The attachment itself, base64, when it is small enough to carry
+    # (`WECOM_INLINE_MEDIA_MAX_BYTES`). Additive and optional: the Gateway and the
+    # ERP are separate services, so `file_path` names a file in the Gateway's
+    # container and `file_url` depends on `WECOM_MEDIA_URL_BASE` naming the
+    # Gateway's public origin — both fail silently, leaving an intake row with no
+    # attachment and no error.
+    "file_b64",
     "source_type",
     "received_at",
     "reply_to_msgid",
@@ -54,6 +61,7 @@ def test_handoff_payload_nullable_defaults():
     assert p.file_url is None
     assert p.file_path is None
     assert p.file_mime is None
+    assert p.file_b64 is None
     assert p.source_type is None
     assert p.received_at is None
     assert p.reply_to_msgid is None

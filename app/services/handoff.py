@@ -5,10 +5,13 @@ ERP intake pipeline and records the ids the ERP gives back.
 """
 from __future__ import annotations
 
+import base64
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+from app.core.config import settings
 from app.models.wecom import WeComContact, WeComMessageLog
 
 logger = logging.getLogger("wecom.handoff")
@@ -21,6 +24,38 @@ def _iso(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def _inline_file(msg: WeComMessageLog) -> str | None:
+    """Base64 of the stored attachment, when it is small enough to carry.
+
+    **Why this exists.** The gateway and the ERP are separate Railway services with
+    separate filesystems. So the two fields that were supposed to carry an
+    attachment across both fail, and each fails silently:
+
+    * `file_path` is a path inside the *gateway's* container. The ERP's
+      `Path(file_path).exists()` is therefore always False — it is not an error,
+      just a file that is never there.
+    * `file_url` only resolves if `WECOM_MEDIA_URL_BASE` names the gateway's
+      *public* origin, and its default is the gateway's own loopback. Wrong here
+      means the ERP records an intake row with no attachment and no error, which
+      is indistinguishable from a customer sending text.
+
+    Carrying the bytes in the body removes both dependencies. It is bounded
+    because the body is JSON — past the cap the URL is still the only channel, so
+    this is an addition, not a replacement.
+    """
+    limit = int(getattr(settings, "inline_media_max_bytes", 0) or 0)
+    if limit <= 0 or not msg.file_path:
+        return None
+    try:
+        path = Path(msg.file_path)
+        if not path.is_file() or path.stat().st_size > limit:
+            return None
+        return base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError as exc:  # noqa: BLE001 - the URL fallback still applies
+        logger.warning("Could not inline attachment %s: %s", msg.file_path, exc)
+        return None
 
 
 def build_payload(msg: WeComMessageLog) -> dict:
@@ -36,6 +71,7 @@ def build_payload(msg: WeComMessageLog) -> dict:
         "file_url": msg.file_url,
         "file_path": msg.file_path,
         "file_mime": msg.file_mime,
+        "file_b64": _inline_file(msg),
         "source_type": msg.source_type,
         "received_at": _iso(msg.received_at),
         "reply_to_msgid": msg.reply_to_msgid,

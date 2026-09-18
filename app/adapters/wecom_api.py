@@ -594,6 +594,24 @@ class RealWeComApi:
         first chunk returns successfully and produces a file silently truncated
         at 512 KB, which fails later inside the ERP as a parse error pointing at
         entirely the wrong place.
+
+        **The call is ALWAYS isolated**, unlike `decrypt`, which honours
+        `WECOM_SDK_ISOLATE`. `GetMediaData` is a native call on the same vendor
+        blob that aborts its process rather than returning an error code, and it
+        was the one native call left running in the gateway — the live deploy
+        crash-looped on `free(): invalid pointer` roughly half a second after the
+        first `getchatdata` returned.
+
+        That mattered more here than anywhere else: an abort mid-attachment kills
+        the service, and because `pull_once` holds the cursor on a failed entry,
+        the restart re-fetches the same attachment and aborts again — a permanent
+        loop that no attachment can ever clear, blocking every message behind it.
+
+        Deliberately **not** gated on `settings.sdk_isolate`. That toggle exists to
+        debug the *decrypt* binding, and it is one env var an operator can flip;
+        leaving media behind it would mean a stray `WECOM_SDK_ISOLATE=false`
+        silently re-arms the crash loop. There is no reason to run a bulk
+        attachment download in-process, so there is no reason to permit it.
         """
         if (settings.decrypt_provider or "pure").strip().lower() != "sdk":
             raise WeComApiError(
@@ -603,11 +621,11 @@ class RealWeComApi:
                 "the library itself)."
             )
 
-        from app.adapters.wework_sdk import SdkLibraryError, get_sdk
+        from app.adapters.sdk_process import SdkWorkerError, run_media
 
         try:
-            return get_sdk().download_media(sdkfileid), filename
-        except SdkLibraryError as exc:
+            return run_media(sdkfileid), filename
+        except SdkWorkerError as exc:
             raise WeComApiError(f"archive media download failed: {exc}") from exc
 
     # --- outbound ----------------------------------------------------------

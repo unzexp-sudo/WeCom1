@@ -41,6 +41,67 @@ def test_health_reports_no_bot_surface(client):
     assert "bot" not in body
 
 
+# ---------------------------------------------------------------------------
+# /healthz — the platform liveness probe
+# ---------------------------------------------------------------------------
+
+
+def test_healthz_is_what_the_platform_healthcheck_calls():
+    """`railway.toml` must point at the zero-I/O route, not the diagnostic one.
+
+    `/wecom/health` calls the ERP over HTTP and runs COUNT(*) queries. Wiring it
+    to the platform healthcheck makes the container's liveness depend on two
+    other services, and `restartPolicyType = "ON_FAILURE"` turns a blip in
+    either into a restart loop — during which the edge has no healthy backend
+    and answers `502 Application failed to respond` on EVERY path, `/` included.
+    That reads as "the gateway is broken" when the gateway is fine, which is
+    exactly the wrong diagnosis to hand an operator.
+    """
+    import pathlib
+    import re
+
+    cfg = pathlib.Path(__file__).resolve().parents[1] / "railway.toml"
+    text = cfg.read_text(encoding="utf-8")
+    match = re.search(r'^healthcheckPath\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    assert match, "railway.toml has no healthcheckPath"
+    assert match.group(1) == "/healthz", (
+        f"healthcheckPath is {match.group(1)!r} — it must be the zero-I/O route"
+    )
+
+
+def test_healthz_declares_no_dependencies(client):
+    """Structural proof that liveness cannot fail for anyone else's reason.
+
+    A behavioural test could pass while the route still opened a session that
+    happened to work. Asserting there are no dependencies at all is the claim
+    that actually matters, and it cannot rot quietly.
+    """
+    from app.main import app
+
+    route = next(
+        r for r in app.routes if getattr(r, "path", None) == "/healthz"
+    )
+    assert route.dependant.dependencies == [], (
+        "/healthz must not depend on the DB, settings or the ERP"
+    )
+
+    res = client.get("/healthz")
+    assert res.status_code == 200
+    assert res.json() == {"status": "ok"}
+
+
+def test_healthz_survives_an_unreachable_erp(client, monkeypatch):
+    """The ERP being down must not make the gateway look dead."""
+    import app.adapters.erp_client as erp_client
+
+    def _boom(*_a, **_k):
+        raise AssertionError("/healthz must not call the ERP")
+
+    monkeypatch.setattr(erp_client.HttpErpClient, "health", _boom)
+
+    assert client.get("/healthz").status_code == 200
+
+
 def test_health_reports_where_the_pull_loop_is(client, db):
     """The poller's state must be readable WITHOUT the gateway key.
 
@@ -106,6 +167,27 @@ def test_health_points_at_the_gate_switch_when_it_is_off(client, monkeypatch):
     warnings = client.get("/wecom/health").json()["config"]["warnings"]
     assert any("WECOM_INGEST_ONLY_ORDER_GROUPS is off" in w for w in warnings)
     assert not any("fails OPEN" in w for w in warnings)
+
+
+def test_health_warns_when_the_vendor_sdk_runs_in_process(client, monkeypatch):
+    """`WECOM_SDK_ISOLATE=false` is the one setting that takes the SERVICE down.
+
+    The library aborts its process (`free(): invalid pointer`, exit 133) rather
+    than returning an error code, so the symptom is a crash loop with **no**
+    traceback and nothing in the log but the abort — nothing an operator could
+    grep for. The warning is the only place that says so.
+    """
+    monkeypatch.setattr(settings, "sdk_isolate", False)
+
+    warnings = client.get("/wecom/health").json()["config"]["warnings"]
+    assert any("WECOM_SDK_ISOLATE is OFF" in w for w in warnings)
+
+
+def test_health_does_not_warn_about_isolation_when_it_is_on(client, monkeypatch):
+    monkeypatch.setattr(settings, "sdk_isolate", True)
+
+    warnings = client.get("/wecom/health").json()["config"]["warnings"]
+    assert not any("WECOM_SDK_ISOLATE" in w for w in warnings)
 
 
 def test_health_warns_that_a_non_sdk_provider_ingests_nothing(client, monkeypatch):

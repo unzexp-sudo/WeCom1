@@ -167,6 +167,20 @@ def _config_readiness() -> dict:
                 "/wecom/media. The gateway serves attachments at "
                 "/wecom/media/{filename}, so every file_url will 404."
             )
+    # Running the vendor library in-process is the one setting that takes the
+    # SERVICE down rather than failing a message, and it does it with no traceback
+    # — the container just dies and Railway restarts it into the same entry. The
+    # live deploy crash-looped on exactly this shape of failure, so it is worth
+    # naming. Attachments are isolated unconditionally and are NOT affected.
+    if not settings.sdk_isolate:
+        warnings.append(
+            "WECOM_SDK_ISOLATE is OFF — the vendor SDK is running inside the "
+            "gateway's own process. The library aborts the process "
+            "('free(): invalid pointer', exit 133) instead of returning an error, "
+            "so a single entry it cannot parse crash-loops the whole service with "
+            "no traceback and nothing in the log but the abort. Turn it back on "
+            "unless you are deliberately debugging the decrypt binding."
+        )
     # Media is the one thing `pure` cannot do. Every archive attachment
     # (image/file/voice/mixed) goes through `download_media`, which needs the
     # official C SDK and raises under `pure`. That matters more than it sounds:

@@ -1471,3 +1471,151 @@ def test_get_permit_user_list_raises_on_an_errcode(monkeypatch):
         assert "60020" in str(exc)
     else:
         raise AssertionError("expected WeComApiError for errcode 60020")
+
+
+# ---------------------------------------------------------------------------
+# Media isolation — the attachment path
+# ---------------------------------------------------------------------------
+#
+# `GetMediaData` is a native call on the same vendor blob as `DecryptData`, so it
+# aborts the same way. It used to run in the gateway's own process while `decrypt`
+# was isolated — which is why the first image or PDF a customer sent took the
+# service down, and, because `pull_once` holds the cursor on a failed entry, why it
+# then crash-looped on that same attachment forever.
+
+
+def test_media_download_leaves_the_gateway_process(monkeypatch):
+    """The download must go through the worker, exactly as the decrypt does."""
+    from app.adapters import sdk_process as sp
+    from app.adapters import wework_sdk
+
+    seen: dict[str, object] = {}
+
+    def fake_run_media(sdkfileid, **_kwargs):
+        seen["sdkfileid"] = sdkfileid
+        return b"%PDF-1.4 fake"
+
+    def explode():  # pragma: no cover - only reached on the wrong path
+        raise AssertionError("the vendor blob was loaded in the gateway's process")
+
+    monkeypatch.setattr(sp, "run_media", fake_run_media)
+    monkeypatch.setattr(wework_sdk, "get_sdk", explode)
+    monkeypatch.setattr(wa.settings, "decrypt_provider", "sdk")
+    monkeypatch.setattr(wa.settings, "sdk_isolate", True)
+
+    content, name = wa.RealWeComApi().download_media("file-id-1", "order.pdf")
+
+    assert content == b"%PDF-1.4 fake"
+    assert name == "order.pdf", "the filename must survive the round trip"
+    assert seen["sdkfileid"] == "file-id-1"
+
+
+def test_media_download_is_isolated_even_when_the_toggle_is_off(monkeypatch):
+    """Media must NOT be gated on `WECOM_SDK_ISOLATE`.
+
+    That toggle exists to debug the *decrypt* binding. Leaving media behind it
+    means a stray `WECOM_SDK_ISOLATE=false` silently re-arms the crash loop that
+    takes the whole gateway down on the first attachment.
+    """
+    from app.adapters import sdk_process as sp
+    from app.adapters import wework_sdk
+
+    def fake_run_media(_sdkfileid, **_kwargs):
+        return b"%PDF-1.4"
+
+    def explode():  # pragma: no cover - only reached on the wrong path
+        raise AssertionError("the vendor blob was loaded in the gateway's process")
+
+    monkeypatch.setattr(sp, "run_media", fake_run_media)
+    monkeypatch.setattr(wework_sdk, "get_sdk", explode)
+    monkeypatch.setattr(wa.settings, "decrypt_provider", "sdk")
+    monkeypatch.setattr(wa.settings, "sdk_isolate", False)
+
+    content, _ = wa.RealWeComApi().download_media("file-id-2", "order.pdf")
+
+    assert content == b"%PDF-1.4"
+
+
+def test_a_death_during_media_is_per_attachment_not_global():
+    """A media death must not stop the batch.
+
+    The entries behind a bad attachment are readable, and `rehand` can clear the
+    held cursor once the attachment is available again — so this is the opposite
+    of an `Init()` death, which dooms every entry identically.
+    """
+    from app.adapters import sdk_process as sp
+
+    stderr = (
+        b"[worker] stage=library\n[worker] stage=init\n"
+        b"[worker] stage=media\nfree(): invalid pointer\n"
+    )
+
+    assert sp.death_kind(stderr) == sp.DEATH_MEDIA
+    assert sp.is_global_fault(sp.DEATH_MEDIA) is False
+
+
+def test_run_media_returns_the_bytes_the_worker_carried(monkeypatch):
+    from app.adapters import sdk_process as sp
+
+    payload = b"\x89PNG\r\n\x1a\n fake image bytes"
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {"ok": True, "content_b64": base64.b64encode(payload).decode()}
+            ).encode(),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    assert sp.run_media("file-id") == payload
+
+
+def test_run_media_refuses_an_empty_sdkfileid():
+    from app.adapters import sdk_process as sp
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_media("   ")
+
+    assert "sdkfileid" in str(e.value)
+
+
+def test_the_worker_media_op_returns_the_whole_attachment(monkeypatch):
+    """The child must return the assembled bytes, not the first 512 KB chunk."""
+    import types
+
+    from app.adapters import sdk_worker
+
+    class FakeSdk:
+        def load_library(self):
+            return object()
+
+        def load(self):
+            return object()
+
+        def download_media(self, sdkfileid):
+            assert sdkfileid == "file-id-9"
+            return b"chunk-1" + b"chunk-2"
+
+    fake = types.ModuleType("app.adapters.wework_sdk")
+    fake.SdkLibraryError = RuntimeError
+    fake.get_sdk = lambda: FakeSdk()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.adapters.wework_sdk", fake)
+
+    reply = sdk_worker.handle({"op": "media", "sdkfileid": "file-id-9"})
+
+    assert reply["ok"] is True
+    assert base64.b64decode(reply["content_b64"]) == b"chunk-1chunk-2"
+    assert reply["size"] == 14
+
+
+def test_the_worker_media_op_needs_a_sdkfileid():
+    from app.adapters import sdk_worker
+
+    reply = sdk_worker.handle({"op": "media"})
+
+    assert reply["ok"] is False
+    assert "sdkfileid" in reply["error"]

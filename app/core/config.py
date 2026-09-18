@@ -102,6 +102,11 @@ class Settings(BaseSettings):
     # a native abort is uncatchable in Python. In-process that costs the whole
     # gateway — which then crash-loops and never serves a request — rather than the
     # one unreadable entry. Set false only to debug the binding itself.
+    #
+    # This governs EVERY native call, not just the decrypt. `DecryptData` and
+    # `GetMediaData` are calls on the same blob and abort the same way; media used
+    # to run in-process, which is why the first image or PDF a customer sent took
+    # the gateway down with it.
     sdk_isolate: bool = True
 
     # --- Routing --------------------------------------------------------------
@@ -157,6 +162,17 @@ class Settings(BaseSettings):
     # Shared with the ERP on purpose: the ERP reads intake files straight off disk.
     media_dir: str = str(GATEWAY_DIR / "data" / "wecom")
     media_url_base: str = "http://127.0.0.1:8100/wecom/media"
+    # Attachments are ALSO carried inline in the handoff body, up to this many
+    # bytes. The gateway and the ERP are separate services with separate
+    # filesystems, so `file_path` names a file the ERP can never open, and
+    # `file_url` only works if `media_url_base` happens to name the gateway's
+    # public origin — a setting that fails silently when it is wrong, because the
+    # ERP just records an intake row with no attachment and no error.
+    #
+    # Inlining removes both dependencies for the common case (a phone photo, a
+    # PDF order sheet). Larger files fall back to `file_url`, which is why
+    # `media_url_base` still matters. Set to 0 to disable inlining entirely.
+    inline_media_max_bytes: int = 8 * 1024 * 1024
     mock_archive_dir: str = str(GATEWAY_DIR / "data" / "mock_archive")
     mock_media_dir: str = str(GATEWAY_DIR / "data" / "mock_media")
     outbox_dir: str = str(GATEWAY_DIR / "data" / "outbox")

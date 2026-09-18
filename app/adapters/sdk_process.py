@@ -23,6 +23,11 @@ import sys
 from app.core.config import REPO_ROOT
 
 DEFAULT_TIMEOUT = 60.0
+# Media gets its own, longer budget. `download_media` follows the SDK's chunk
+# protocol — ~512 KB per round trip — so a multi-megabyte PDF is dozens of
+# sequential calls, each of which can stall on the network. The 60 s used for a
+# single decrypt would time out mid-file and present as an unreadable attachment.
+MEDIA_TIMEOUT = 300.0
 STDERR_TAIL = 400
 
 # Stable, matchable names for where a worker died. `app/services/archive.py`
@@ -34,12 +39,14 @@ STDERR_TAIL = 400
 DEATH_LIBRARY = "the SDK worker died while loading the shared library"
 DEATH_INIT = "the SDK worker died during Init()"
 DEATH_DECRYPT = "the SDK worker died during DecryptData"
+DEATH_MEDIA = "the SDK worker died during GetMediaData"
 DEATH_PRELOAD = "the SDK worker died before announcing a stage"
 
 _DEATH_LEAD = {
     "library": DEATH_LIBRARY,
     "init": DEATH_INIT,
     "decrypt": DEATH_DECRYPT,
+    "media": DEATH_MEDIA,
 }
 
 # What a death at each stage means. The distinction decides the fix, and the fixes
@@ -59,6 +66,11 @@ _DEATH_MEANING = {
     DEATH_DECRYPT: (
         " — per-message, so only entries shaped like this one are affected, and the "
         "library aborted rather than returning an error code"
+    ),
+    DEATH_MEDIA: (
+        " — per-attachment, so only this attachment is affected. The entry stays "
+        "failed and the cursor stays held below it, so nothing queued behind it is "
+        "lost; rehand re-attempts it once the attachment is readable again"
     ),
     DEATH_PRELOAD: (
         " — the worker died before making any call, so the interpreter or its "
@@ -226,3 +238,42 @@ def run_probe(*, sdk_path: str | None = None, timeout: float = DEFAULT_TIMEOUT) 
     prevent, and a probe must not be able to do what the poller cannot.
     """
     return _run({"op": "probe", "sdk_path": sdk_path or ""}, timeout=timeout)
+
+
+def run_media(
+    sdkfileid: str,
+    *,
+    sdk_path: str | None = None,
+    timeout: float = MEDIA_TIMEOUT,
+) -> bytes:
+    """Fetch one archived attachment in a child process. Raises `SdkWorkerError`.
+
+    The bytes come back base64-encoded on the protocol fd and are decoded here, so
+    the caller sees exactly what `WeWorkFinanceSdk.download_media` would have
+    returned — a complete attachment, not a 512 KB first chunk.
+
+    Deliberately **not** listed in `_GLOBAL_FAULTS`: a death here is per-attachment,
+    so the entries behind it may be perfectly readable. Treating it as global would
+    stop the batch and hold the cursor on an entry the operator could have skipped
+    past with `rehand`.
+    """
+    if not (sdkfileid or "").strip():
+        raise SdkWorkerError("run_media called with an empty sdkfileid")
+
+    reply = _run(
+        {"op": "media", "sdkfileid": sdkfileid, "sdk_path": sdk_path or ""},
+        timeout=timeout,
+    )
+
+    if not reply.get("ok"):
+        raise SdkWorkerError(
+            str(reply.get("error") or "the SDK worker reported no reason")
+        )
+
+    encoded = reply.get("content_b64")
+    if not encoded:
+        raise SdkWorkerError("the SDK worker returned no attachment content")
+    try:
+        return base64.b64decode(encoded)
+    except Exception as exc:  # noqa: BLE001 - a garbled reply is still a failure
+        raise SdkWorkerError(f"the worker's attachment payload is not base64: {exc}") from exc

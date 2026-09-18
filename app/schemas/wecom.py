@@ -38,6 +38,15 @@ class HandoffPayload(BaseModel):
     file_url: str | None = None
     file_path: str | None = None
     file_mime: str | None = None
+    # The attachment itself, base64, when it is small enough to carry.
+    #
+    # Additive and optional, so an older ERP simply ignores it and falls back to
+    # `file_url` — which is why this does not bump the contract version. It exists
+    # because the two fields above both fail *silently* across services:
+    # `file_path` names a file in the Gateway's container, and `file_url` needs
+    # `WECOM_MEDIA_URL_BASE` to name the Gateway's public origin. See
+    # `app/services/handoff._inline_file`.
+    file_b64: str | None = None
     source_type: SourceType | None = None
     received_at: str | None = None
     reply_to_msgid: str | None = None

@@ -1,6 +1,8 @@
 """app/services/handoff.py — the ERP payload (§6). Owner: agent [A]."""
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 handoff = pytest.importorskip(
@@ -100,6 +102,86 @@ def test_build_payload_carries_media_fields(db):
     assert payload["file_url"].endswith("/a.pdf")
     assert payload["file_mime"] == "application/pdf"
     assert payload["source_type"] == "pdf"
+    # `/tmp/a.pdf` does not exist, so there is nothing to inline — and that must be
+    # a null field, not an exception. The URL remains the fallback.
+    assert payload["file_b64"] is None
+
+
+def test_a_small_attachment_is_carried_in_the_body(db, tmp_path, monkeypatch):
+    """The ERP cannot read the Gateway's disk, so the bytes travel in the payload.
+
+    `file_path` is a path in the Gateway's own container and `file_url` depends on
+    `WECOM_MEDIA_URL_BASE` naming the Gateway's public origin. Both fail silently,
+    which is why the attachment has to be in the body.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "inline_media_max_bytes", 1024)
+
+    pdf = tmp_path / "order.pdf"
+    pdf.write_bytes(b"%PDF-1.4 small order")
+
+    msg = WeComMessageLog(
+        msgid="wm-inline",
+        msgtype="file",
+        file_path=str(pdf),
+        file_url="http://127.0.0.1:8100/wecom/media/order.pdf",
+        file_mime="application/pdf",
+        source_type="pdf",
+    )
+    db.add(msg)
+    db.commit()
+
+    payload = handoff.build_payload(msg)
+
+    assert base64.b64decode(payload["file_b64"]) == b"%PDF-1.4 small order"
+
+
+def test_an_oversized_attachment_falls_back_to_the_url(db, tmp_path, monkeypatch):
+    """Inlining is bounded — the body is JSON, so past the cap the URL is all we have."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "inline_media_max_bytes", 8)
+
+    pdf = tmp_path / "big.pdf"
+    pdf.write_bytes(b"x" * 64)
+
+    msg = WeComMessageLog(
+        msgid="wm-big",
+        msgtype="file",
+        file_path=str(pdf),
+        file_url="http://127.0.0.1:8100/wecom/media/big.pdf",
+        file_mime="application/pdf",
+        source_type="pdf",
+    )
+    db.add(msg)
+    db.commit()
+
+    payload = handoff.build_payload(msg)
+
+    assert payload["file_b64"] is None
+    assert payload["file_url"].endswith("/big.pdf")
+
+
+def test_inlining_can_be_switched_off(db, tmp_path, monkeypatch):
+    """`0` disables it, so an operator can fall back to pure URL delivery."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "inline_media_max_bytes", 0)
+
+    pdf = tmp_path / "order.pdf"
+    pdf.write_bytes(b"%PDF-1.4 small order")
+
+    msg = WeComMessageLog(
+        msgid="wm-off",
+        msgtype="file",
+        file_path=str(pdf),
+        source_type="pdf",
+    )
+    db.add(msg)
+    db.commit()
+
+    assert handoff.build_payload(msg)["file_b64"] is None
 
 
 def test_handoff_succeeds_and_records_the_job(db, mock_erp):
