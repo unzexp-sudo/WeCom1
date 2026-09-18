@@ -77,8 +77,25 @@ class Settings(BaseSettings):
     # missing. Pinned to a vendor URL and verified by md5, so this is a supply
     # of a known artefact rather than a live dependency on the network.
     archive_sdk_autofetch: bool = True
-    # "pure" = pure-Python RSA/AES via `cryptography`; "sdk" = official C SDK
-    decrypt_provider: str = "pure"
+    # "sdk" = WeCom's official C SDK (the only provider that WORKS); "pure" =
+    # pure-Python RSA/AES via `cryptography`, kept for diagnosis only.
+    #
+    # DEFAULT IS "sdk" BECAUSE "pure" IS STRUCTURALLY IMPOSSIBLE — not merely
+    # misconfigured. `encrypt_chat_msg` is not base64 AES ciphertext; it is a
+    # vendor envelope, so its decoded length is not a multiple of the AES block
+    # size and `pure` raises "The length of the provided data is not a multiple of
+    # the block length" for EVERY entry, forever, with no key change able to help.
+    # Measured proof, from the sample payload embedded in the vendor's own
+    # `WeWorkFinanceSdk_C.h`: its `encrypt_chat_msg` is 318 chars → 238 bytes →
+    # mod16 14. A live tenant shows the same shape (437 chars → 327 bytes → mod16
+    # 7). Only the vendor's own `DecryptData` parses the envelope.
+    #
+    # Defaulting to "pure" cost days: a deploy looked healthy, the poller looped,
+    # and the only symptom was a `fetched: 0` that is byte-identical to an empty
+    # archive. Do not default back to it. "pure" needs no SDK, so it remains useful
+    # for isolating an RSA/key question from a library question — set it
+    # deliberately, and read the health hint, which names it.
+    decrypt_provider: str = "sdk"
     # Run the vendor SDK in a throwaway child process instead of in-process.
     # DEFAULT TRUE, because the library does not fail politely: handed input it
     # cannot parse it aborts the process (`free(): invalid pointer`, exit 133), and

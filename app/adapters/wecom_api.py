@@ -410,17 +410,44 @@ class RealWeComApi:
             "first_error_shape": first_shape,
         }
         if decrypt_failed:
+            # The actionable fix belongs HERE, not only in the health hint. The
+            # operator reads the log; this message used to say "the cause is named
+            # in the first-failure text above", and that text is a bare
+            # `ValueError: The length of the provided data is not a multiple of the
+            # block length` — which names neither the cause nor the fix. A
+            # `pure`-provider deploy could therefore sit broken for days behind a
+            # healthy-looking poller.
+            mod16 = (first_shape or {}).get("encrypt_chat_msg_mod16")
+            provider = (settings.decrypt_provider or "").strip().lower()
+            if mod16 and provider != "sdk":
+                advice = (
+                    f" FIX: the decoded ciphertext is not a whole number of AES "
+                    f"blocks (mod16={mod16}) while the provider is {provider!r}. That "
+                    "is a property of the vendor ENVELOPE, not of the key — no key "
+                    "change can fix it, and the vendor's own doc sample is unaligned "
+                    "too. Only the official SDK parses the envelope, so set "
+                    "WECOM_DECRYPT_PROVIDER=sdk."
+                )
+            elif mod16:
+                advice = (
+                    f" The provider is already 'sdk' and the shape is still "
+                    f"mod16={mod16}, so this is NOT a provider setting. Read the "
+                    "named stage in the /wecom/health hint."
+                )
+            else:
+                advice = (
+                    " Read the cause in the /wecom/health hint. Do not assume the "
+                    "key: it has been measured and it matches."
+                )
             logger.error(
                 "Archive decryption failed for %s of %s entries (first: %s). "
                 "The pull reports fetched=%s, and a TOTAL failure is byte-identical "
-                "to an empty archive in the response — hence this ERROR. The cause "
-                "is named in the first-failure text above and repeated by "
-                "/wecom/health as a hint; do not assume the key, which has been "
-                "measured and matches.",
+                "to an empty archive in the response — hence this ERROR.%s",
                 decrypt_failed,
                 len(chatdata),
                 first_error,
                 len(out),
+                advice,
             )
         return out
 

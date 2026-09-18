@@ -213,8 +213,38 @@ def test_real_api_refuses_without_credentials(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_get_decryptor_defaults_to_pure():
+def test_get_decryptor_defaults_to_the_sdk_because_pure_cannot_work(monkeypatch):
+    """The default must be the provider that CAN read the archive.
+
+    This test used to assert `PureCryptoDecryptor`, i.e. it pinned the bug. `pure`
+    is not merely misconfigured here — it is structurally impossible: the vendor's
+    `encrypt_chat_msg` is an envelope, not AES ciphertext, so its decoded length is
+    not a multiple of the block size and every entry fails forever. The vendor's own
+    doc sample is unaligned too (318 chars → mod16 14). Defaulting to `pure` meant a
+    deploy looked healthy — poller looping, health answering — while ingesting
+    nothing, which is exactly how this stalled for days.
+    """
+    from app.adapters import decrypt as dec
+
+    monkeypatch.setattr(dec.settings, "decrypt_provider", "sdk")
+    assert isinstance(get_decryptor(), dec.SdkDecryptor)
+
+
+def test_pure_remains_selectable_for_diagnosis(monkeypatch):
+    """`pure` needs no SDK, so it stays useful for isolating a key question from a
+    library question — it just must not be the default."""
+    from app.adapters import decrypt as dec
+
+    monkeypatch.setattr(dec.settings, "decrypt_provider", "pure")
     assert isinstance(get_decryptor(), PureCryptoDecryptor)
+
+
+def test_the_default_provider_is_not_pure():
+    """Guards the shipped default itself, not the dispatch: a future edit that
+    reverts `decrypt_provider` to "pure" would otherwise pass every other test."""
+    from app.core.config import Settings
+
+    assert Settings.model_fields["decrypt_provider"].default == "sdk"
 
 
 def test_pure_decryptor_requires_a_private_key():
@@ -1149,6 +1179,90 @@ def test_get_chat_data_keeps_going_after_a_per_message_fault(monkeypatch):
 
     assert attempts == [1, 2]
     assert api.last_pull_stats["failed_seqs"] == [1, 2]
+
+
+def test_the_failure_log_names_the_provider_fix(monkeypatch, caplog):
+    """The log is what the operator actually reads — so the fix must be in it.
+
+    This message used to say "the cause is named in the first-failure text above",
+    and that text is a bare `ValueError: The length of the provided data is not a
+    multiple of the block length` — which names neither the cause nor the fix. A
+    `pure` deploy therefore sat broken for days behind a healthy-looking poller:
+    the loop ran, health answered, and the one line that mattered pointed at
+    nothing. The actionable sentence has to be in the log itself.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = (
+                '{"errcode":0,"chatdata":['
+                '{"seq":1,"msgid":"m1","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="}]}'
+            )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    def boom(*_args, **_kwargs):
+        raise DecryptError(
+            "The length of the provided data is not a multiple of the block length."
+        )
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+    monkeypatch.setattr(wa.settings, "decrypt_provider", "pure")
+    monkeypatch.setattr("app.adapters.decrypt.decrypt_entry", boom)
+
+    with caplog.at_level("ERROR", logger="wecom.api"):
+        wa.RealWeComApi().get_chat_data(seq=0, limit=10, timeout=5)
+
+    text = caplog.text
+    assert "WECOM_DECRYPT_PROVIDER=sdk" in text
+    assert "mod16=1" in text
+    assert "no key change can fix it" in text
+
+
+def test_the_failure_log_does_not_repeat_the_provider_fix_when_already_sdk(
+    monkeypatch, caplog
+):
+    """Otherwise the operator who has already set `sdk` gets told to set `sdk` —
+    a no-op that hides the real fault."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "gettoken" in str(request.url):
+            body = '{"errcode":0,"access_token":"tok","expires_in":7200}'
+        else:
+            body = (
+                '{"errcode":0,"chatdata":['
+                '{"seq":1,"msgid":"m1","encrypt_random_key":"AA==",'
+                '"encrypt_chat_msg":"AA=="}]}'
+            )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    def fake_client(timeout: float = 30.0) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+
+    def boom(*_args, **_kwargs):
+        raise DecryptError("the SDK worker died during DecryptData — per-message")
+
+    monkeypatch.setattr(wa, "_client", fake_client)
+    monkeypatch.setattr(wa.settings, "corp_id", "wwtest")
+    monkeypatch.setattr(wa.settings, "archive_secret", "s3cret")
+    monkeypatch.setattr(wa.settings, "decrypt_provider", "sdk")
+    monkeypatch.setattr("app.adapters.decrypt.decrypt_entry", boom)
+
+    with caplog.at_level("ERROR", logger="wecom.api"):
+        wa.RealWeComApi().get_chat_data(seq=0, limit=10, timeout=5)
+
+    text = caplog.text
+    assert "WECOM_DECRYPT_PROVIDER=sdk" not in text
+    assert "NOT a provider setting" in text
 
 
 def test_get_permit_user_list_uses_the_msgaudit_namespace(monkeypatch):

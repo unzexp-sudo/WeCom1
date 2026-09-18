@@ -124,6 +124,22 @@ async def lifespan(_: FastAPI):
             "(or WECOM_ARCHIVE_PRIVATE_KEY_B64) to enable Session Archive ingestion"
         )
 
+    # A non-`sdk` provider cannot read the archive envelope at all: its decoded
+    # length is not a multiple of the AES block size, by the vendor's own design
+    # (their doc sample is unaligned too). Say so at boot, loudly, because the only
+    # symptom is a `fetched: 0` that is byte-identical to a genuinely empty
+    # archive — the poller loops happily, health answers, and nothing ever arrives.
+    # That silence is what let a misconfigured provider sit for days.
+    if (settings.decrypt_provider or "").strip().lower() != "sdk":
+        logger.warning(
+            "startup: WECOM_DECRYPT_PROVIDER=%s — this provider CANNOT decrypt "
+            "Session Archive messages. encrypt_chat_msg is a vendor envelope, not "
+            "AES ciphertext, so every entry fails with 'not a multiple of the block "
+            "length' and no key change can help. Set WECOM_DECRYPT_PROVIDER=sdk to "
+            "ingest orders.",
+            settings.decrypt_provider,
+        )
+
     yield
 
 
