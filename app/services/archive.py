@@ -310,16 +310,33 @@ def pull_once(db, *, api=None, erp=None) -> dict:
         # fixes. An earlier version of this hint named the key unconditionally,
         # and sent the operator to re-upload a public key that was never wrong.
         shape_mod16 = (first_shape or {}).get("encrypt_chat_msg_mod16")
-        if shape_mod16:
+        first_error = stats.get("first_error") or ""
+        provider = (settings.decrypt_provider or "pure").strip().lower()
+        if "Init() failed" in first_error:
+            # Checked first because it is the most specific, and because both
+            # branches below would mislabel it. `mod16 != 0` is a property of the
+            # envelope and holds under EVERY provider, so gating on it alone told
+            # an operator who had already set provider=sdk to "set
+            # WECOM_DECRYPT_PROVIDER=sdk" — a no-op instruction that hid the real
+            # fault. A key fault is a third, unrelated thing.
+            cause = (
+                "The SDK library loaded but Init() was rejected, so no entry could "
+                "be decrypted. That is a CREDENTIAL fault — not a key fault, and "
+                "not a provider fault. Check WECOM_ARCHIVE_SECRET, and check that "
+                "this egress IP is in the archive's Trusted IP list (a rejection "
+                "there is code 10009). That address is a POOL, so allow every "
+                "address you have seen rather than the most recent one. "
+            )
+        elif shape_mod16 and provider != "sdk":
             cause = (
                 "The first entry decodes to a length that is not a whole number "
                 f"of AES blocks (mod16={shape_mod16}), which is a property of the "
                 "BYTES and not of the key — no key change can fix it. This is the "
-                "expected result of WECOM_DECRYPT_PROVIDER=pure: encrypt_chat_msg "
-                "is not base64 ciphertext but a structured envelope (a "
-                "13-character prefix, a 32-character key slice, then the payload "
-                "at a protobuf-derived offset), and only WeCom's own DecryptData "
-                "parses it. Set WECOM_DECRYPT_PROVIDER=sdk. "
+                f"expected result of WECOM_DECRYPT_PROVIDER={provider}: "
+                "encrypt_chat_msg is not base64 ciphertext but a structured "
+                "envelope (a 13-character prefix, a 32-character key slice, then "
+                "the payload at a protobuf-derived offset), and only WeCom's own "
+                "DecryptData parses it. Set WECOM_DECRYPT_PROVIDER=sdk. "
             )
         else:
             cause = (

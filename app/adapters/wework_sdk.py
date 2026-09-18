@@ -16,6 +16,11 @@ codebase before this module existed:**
    `GetMediaData(sdk, indexbuf, sdkFileid, proxy, passwd, timeout, media_data)`.
    The reverse order is the natural guess, and it silently fetches nothing.
 
+**And one ordering rule that is worse than either, because it does not return an
+error at all** — see `WeWorkFinanceSdk.decrypt`: `DecryptData` needs no handle,
+but it does need the library to have been `Init()`ed, and calling it on an
+uninitialised library aborts the process with `free(): invalid pointer`.
+
 **And one class of bug that does not raise:** any function returning a pointer
 needs an explicit `restype`. Without it ctypes assumes `int`, so a 64-bit pointer
 is **truncated to 32 bits** and handed to the C library as a wild address. Every
@@ -59,6 +64,18 @@ def resolved_sdk_path() -> str:
 
 
 class SdkLibraryError(RuntimeError):
+    pass
+
+
+class SdkInitError(SdkLibraryError):
+    """`Init()` was rejected — a credential fault, not a decryption fault.
+
+    It gets its own type because it is otherwise indistinguishable from a wrong
+    key: both make *every* entry fail, so `fetched: 0` looks the same from
+    outside the container. The difference is the fix — this one needs a corp
+    secret or an archive Trusted-IP entry, and no key change will touch it.
+    """
+
     pass
 
 
@@ -203,7 +220,7 @@ class WeWorkFinanceSdk:
             raise SdkLibraryError("NewSdk() returned NULL")
         rc = lib.Init(sdk, self.corpid.encode(), self.secret.encode())
         if rc != 0:
-            raise SdkLibraryError(f"Init() failed: {rc} ({code_hint(rc)})")
+            raise SdkInitError(f"Init() failed: {rc} ({code_hint(rc)})")
 
         self._sdk = sdk
         logger.info("WeCom finance SDK initialised from %s", self.path)
@@ -228,16 +245,31 @@ class WeWorkFinanceSdk:
         field from the pull response fails as code `10008 解析encrypt_key出错`.
         `app.adapters.decrypt.rsa_decrypt_random_key` produces the right value.
 
-        Only `load_library()` is needed here, never `load()`. `DecryptData` is a
-        static function — its mangled symbol is
-        `WeWorkFinanceSdk::DecryptData(std::string const&, std::string const&,
-        std::string*)`, with no handle — so it does no authentication and no
-        network I/O. Calling `Init()` first would make text decryption depend on
-        an authenticated round trip that cannot affect the result, and an
-        `Init()` rejection would then surface as "every entry failed to decrypt":
-        the same symptom as a wrong key, with a hint pointing at the wrong cause.
+        **`Init()` is required before `DecryptData`, even though `DecryptData`
+        takes no handle.** This was got wrong once, and it crash-looped the
+        gateway, so the evidence is worth keeping:
+
+        * `DecryptData` really is static — the mangled symbol is
+          `WeWorkFinanceSdk::DecryptData(std::string const&, std::string const&,
+          std::string*)`. No handle is passed, and this binding does not pass one.
+        * That proves nothing about *process-global* state. The vendor's own C
+          sample, `tool_testSdk.cpp`, calls `NewSdk()` + `Init()` **unconditionally
+          before its `type` branch**, so its `type == 3` decrypt path only ever
+          runs on an already-initialised library — the branch merely does not
+          *repeat* the call.
+        * Calling `DecryptData` on an uninitialised library does not return an
+          error. It corrupts the heap and glibc aborts the process:
+          `free(): invalid pointer`, exit code 133. No Python `except` can catch
+          it, so it presents as a crash loop of the whole gateway, not as a
+          failed decryption.
+
+        The reason `Init()` was briefly dropped here is still valid as a
+        *diagnostic* worry — an `Init()` rejection fails every entry, which looks
+        exactly like a wrong key. It is resolved by `SdkInitError` rather than by
+        skipping the call: keep the initialisation, and let the error say which
+        fault it is.
         """
-        lib = self.load_library()
+        lib = self.load()
         sl = lib.NewSlice()
         if not sl:
             raise SdkLibraryError("NewSlice() returned NULL")

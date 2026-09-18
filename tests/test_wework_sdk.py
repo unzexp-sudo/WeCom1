@@ -191,19 +191,40 @@ def test_decrypt_returns_the_decrypted_text(fake):
     assert _sdk().decrypt("KEY", "MSG") == '{"msgid":"M1","msgtype":"text"}'
 
 
-def test_decrypt_does_not_need_an_authenticated_init(fake):
-    """`DecryptData` is static: no handle, no `Init()`, no network.
+def test_decrypt_initialises_the_library_before_the_native_call(fake):
+    """`DecryptData` takes no handle — but it still needs an initialised library.
 
-    Requiring `Init()` here makes text decryption depend on an authenticated
-    round trip that cannot affect the result — and an `Init()` rejection then
-    looks *exactly* like a wrong key (every entry fails, `fetched: 0`), so the
-    hint points at the key while the real fault is the corp secret or the IP
-    allowlist. Regression guard for that misattribution.
+    The mangled symbol proves only that no *handle* is passed, which is a
+    different claim. Calling the native decrypt on an uninitialised library does
+    not return an error code: it corrupts the heap and glibc aborts the process
+    (`free(): invalid pointer`, exit 133). No Python `except` can catch that, so
+    it presents as a gateway crash loop rather than as a failed decryption — and
+    the vendor's own `tool_testSdk.cpp` calls `NewSdk()` + `Init()`
+    unconditionally *before* its decrypt branch. Regression guard for exactly
+    that crash.
     """
     _sdk().decrypt("KEY", "MSG")
 
-    assert not fake.named("Init"), "decrypt() authenticated via Init()"
-    assert not fake.named("NewSdk"), "decrypt() built an sdk handle it does not need"
+    order = [name for name, _ in fake.calls]
+    assert "Init" in order, "decrypt() reached the native call without Init()"
+    assert order.index("Init") < order.index("DecryptData"), (
+        f"Init() must precede DecryptData; the call order was {order}"
+    )
+
+
+def test_a_rejected_init_never_reaches_the_native_call(fake):
+    """An `Init()` rejection must stop *before* `DecryptData` — that call is the
+    abort, so "it failed cleanly" and "it took the process down" are separated by
+    this one line."""
+    fake._init_rc = 10009
+
+    with pytest.raises(ws.SdkInitError) as e:
+        _sdk().decrypt("KEY", "MSG")
+
+    assert "10009" in str(e.value)
+    assert not fake.named("DecryptData"), (
+        "DecryptData ran after a failed Init() — this is the heap abort"
+    )
 
 
 def test_decrypt_accepts_the_rsa_decrypted_key_as_bytes(fake):
