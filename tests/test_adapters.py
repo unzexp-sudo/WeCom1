@@ -1054,6 +1054,15 @@ def test_is_global_fault_separates_init_deaths_from_message_deaths():
     assert is_global_fault(f"DecryptError: {DEATH_INIT} — ...")
     assert is_global_fault(f"DecryptError: {DEATH_PRELOAD} — ...")
     assert is_global_fault("DecryptError: Init() failed: 10009 (ip非法)")
+    # The boot race: the autofetch is a daemon thread, so the first tick can beat
+    # it. Global and self-healing — stop the batch, do not warn per entry.
+    assert is_global_fault(
+        "DecryptError: WeCom finance SDK not found: /app/vendor/libWeWorkFinanceSdk_C.so"
+    )
+    assert is_global_fault(
+        "DecryptError: WECOM_ARCHIVE_SDK_PATH is not set — point it at "
+        "libWeWorkFinanceSdk_C.so"
+    )
 
     assert not is_global_fault(f"DecryptError: {DEATH_DECRYPT} — ...")
     assert not is_global_fault("DecryptError: RSA decrypt failed: bad padding")

@@ -270,7 +270,7 @@ environment variables or a `.env` file — **never commit real values**.
 | `WECOM_ARCHIVE_PRIVATE_KEY_PATH` | `""` | path to the RSA-2048 **private** key PEM whose public half you uploaded to WeCom. **PATH ONLY — never put the key material in an env var.** |
 | `WECOM_ARCHIVE_SDK_PATH` | `""` | path to the official `WeWorkFinanceSdk` `.so`. **Leave empty** to use the location the gateway fetches into (`vendor/`) — the container is ephemeral, so an operator cannot know this path in advance. |
 | `WECOM_ARCHIVE_SDK_AUTOFETCH` | `true` | fetch the official SDK at boot into `vendor/libWeWorkFinanceSdk_C.so` when `WECOM_ARCHIVE_SDK_PATH` is empty. Only runs under `WECOM_DECRYPT_PROVIDER=sdk` |
-| `WECOM_DECRYPT_PROVIDER` | `pure` | `pure` = pure-Python RSA+AES via `cryptography` (text only); `sdk` = official C SDK via ctypes (**required for attachments**) |
+| `WECOM_DECRYPT_PROVIDER` | `sdk` | `sdk` = official C SDK via ctypes — **the only provider that can read the archive**, and **required for attachments**. `pure` = pure-Python RSA+AES via `cryptography`, for **diagnosis only**: `encrypt_chat_msg` is a vendor envelope rather than AES ciphertext, so `pure` fails every entry with "not a multiple of the block length" and no key change can fix it. |
 | `WECOM_ARCHIVE_PULL_INTERVAL` | `30` | seconds between archive polls |
 | `WECOM_ARCHIVE_LIMIT` | `1000` | max entries per pull |
 | `WECOM_ARCHIVE_TIMEOUT` | `5` | seconds per pull HTTP call |

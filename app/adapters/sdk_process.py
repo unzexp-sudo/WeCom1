@@ -109,7 +109,19 @@ def death_kind(stderr: bytes) -> str:
 # Faults that make EVERY remaining entry fail identically. Retrying them spawns
 # one doomed worker per entry and prints one identical ERROR per entry — which
 # reads as a flood and buries the single real cause.
-_GLOBAL_FAULTS = (DEATH_LIBRARY, DEATH_INIT, DEATH_PRELOAD, "Init() failed")
+#
+# The last two are the boot race: the SDK autofetch runs on a daemon thread, so the
+# poller's first tick can run before the library is on disk. That is global (every
+# entry fails the same way) and self-healing on the next tick, so stop the batch
+# rather than printing one warning per entry.
+_GLOBAL_FAULTS = (
+    DEATH_LIBRARY,
+    DEATH_INIT,
+    DEATH_PRELOAD,
+    "Init() failed",
+    "WeCom finance SDK not found",
+    "WECOM_ARCHIVE_SDK_PATH is not set",
+)
 
 
 def is_global_fault(error: str) -> bool:
