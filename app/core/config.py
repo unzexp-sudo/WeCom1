@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     archive_sdk_autofetch: bool = True
     # "pure" = pure-Python RSA/AES via `cryptography`; "sdk" = official C SDK
     decrypt_provider: str = "pure"
+    # Run the vendor SDK in a throwaway child process instead of in-process.
+    # DEFAULT TRUE, because the library does not fail politely: handed input it
+    # cannot parse it aborts the process (`free(): invalid pointer`, exit 133), and
+    # a native abort is uncatchable in Python. In-process that costs the whole
+    # gateway — which then crash-loops and never serves a request — rather than the
+    # one unreadable entry. Set false only to debug the binding itself.
+    sdk_isolate: bool = True
 
     # --- Routing --------------------------------------------------------------
     staff_userids: str = ""

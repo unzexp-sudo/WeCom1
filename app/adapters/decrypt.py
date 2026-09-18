@@ -137,6 +137,19 @@ def classify_archive_key(key: bytes) -> dict[str, Any]:
     }
 
 
+# The live archive's `encrypt_key` is an **88-character printable ASCII string**,
+# measured 2026-09-18 via `/wecom/health` (`archive_key_length: 88`). So the bound
+# below is deliberately generous, and exists only to reject nonsense — the real
+# discriminator is `printable_ascii`, because pseudorandom rejection bytes are
+# printable with probability ~1e-14 over 88 bytes.
+#
+# An earlier version of this guard capped the length at 64 and would have rejected a
+# perfectly good key, reporting a key mismatch that did not exist. That is the same
+# class of confidently-wrong message the rest of this module exists to prevent, so
+# the number is recorded here rather than guessed at again.
+MAX_PLAUSIBLE_KEY_BYTES = 1024
+
+
 def archive_key_is_plausible(key: bytes) -> bool:
     """Whether `key` can be a real WeCom `encrypt_key`.
 
@@ -147,11 +160,16 @@ def archive_key_is_plausible(key: bytes) -> bool:
     message that failed to decrypt", it is a dead container. Refusing here turns
     that back into an ordinary `DecryptError`, which the poller holds the cursor
     on and the health hint can explain.
+
+    The test is *printability*, not a length range: a real key is a `const char *`
+    that the vendor's own sample passes on a command line, so it is printable and
+    NUL-free, while rejection bytes are neither. Keep the length check loose — see
+    `MAX_PLAUSIBLE_KEY_BYTES`.
     """
     shape = classify_archive_key(key)
     return (
         bool(key)
-        and 8 <= shape["archive_key_length"] <= 64
+        and shape["archive_key_length"] <= MAX_PLAUSIBLE_KEY_BYTES
         and shape["archive_key_printable_ascii"]
     )
 
@@ -240,28 +258,26 @@ class SdkDecryptor:
     """Decryption through WeCom's official finance SDK.
 
     The ctypes binding itself lives in `app/adapters/wework_sdk.py`, which
-    documents the two signatures that are easy to get wrong. This class is only
-    the adapter behind the `Decryptor` protocol — it holds no library state, so
-    the handle stays shared and `Init()` is paid once per process rather than
-    once per message.
+    documents the signatures and the call order that are easy to get wrong.
 
     It does one thing the binding deliberately does not: the RSA step.
     `DecryptData` expects the RSA-DECRYPTED `encrypt_random_key`, while this
     protocol hands over the raw field from the pull response, so the two are not
     interchangeable and the difference is silent — the SDK simply reports
     `10008 解析encrypt_key出错`. `rsa_decrypt_random_key` is the conversion.
+
+    **By default the native call happens in a child process** (`sdk_isolate`), so
+    an abort inside the vendor library costs one entry rather than the gateway.
+    That trades one interpreter start and one `Init()` per decrypted *entry*
+    instead of per *process* — worth it, because the archive delivers a handful of
+    messages per pull and a decrypted order is worth far more than the saved
+    milliseconds. `_decrypt_in_process` remains for debugging the binding itself.
     """
 
     def __init__(self, sdk_path: str | None = None) -> None:
         self.sdk_path = sdk_path or settings.archive_sdk_path
 
     def decrypt(self, encrypt_random_key: str, encrypt_chat_msg: str) -> str:
-        from app.adapters.wework_sdk import SdkLibraryError, get_sdk
-
-        sdk = get_sdk()
-        if self.sdk_path:
-            sdk.path = self.sdk_path
-
         # Not optional: `DecryptData`'s first argument is the decrypted content,
         # not the base64 field. See `rsa_decrypt_random_key`.
         encrypt_key = rsa_decrypt_random_key(encrypt_random_key)
@@ -284,6 +300,35 @@ class SdkDecryptor:
                 "Archiving page, or point WECOM_ARCHIVE_PRIVATE_KEY_B64 at the "
                 "private key matching the public key already there."
             )
+
+        if settings.sdk_isolate:
+            return self._decrypt_isolated(encrypt_key, encrypt_chat_msg)
+        return self._decrypt_in_process(encrypt_key, encrypt_chat_msg)
+
+    def _decrypt_isolated(self, encrypt_key: bytes, encrypt_chat_msg: str) -> str:
+        """Native decrypt in a throwaway child process — the default.
+
+        The vendor library aborts the process rather than returning an error when
+        it dislikes its input, and a native abort cannot be caught in Python. Here
+        it costs one entry instead of the gateway. See `app/adapters/sdk_process.py`.
+        """
+        from app.adapters.sdk_process import SdkWorkerError, run_decrypt
+
+        try:
+            return run_decrypt(
+                encrypt_key, encrypt_chat_msg, sdk_path=self.sdk_path or None
+            )
+        except SdkWorkerError as exc:
+            raise DecryptError(str(exc)) from exc
+
+    def _decrypt_in_process(self, encrypt_key: bytes, encrypt_chat_msg: str) -> str:
+        """Native decrypt in this process. Only for debugging the binding —
+        an abort here takes the whole service down with it."""
+        from app.adapters.wework_sdk import SdkLibraryError, get_sdk
+
+        sdk = get_sdk()
+        if self.sdk_path:
+            sdk.path = self.sdk_path
 
         try:
             return sdk.decrypt(encrypt_key, encrypt_chat_msg)

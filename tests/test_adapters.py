@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import base64
+import json
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -396,6 +399,10 @@ def test_sdk_decryptor_does_the_rsa_step_the_binding_will_not(monkeypatch, tmpdi
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     pem = _write_key(tmpdir / "k.pem", key)
     monkeypatch.setattr(dec.settings, "archive_private_key_path", str(pem))
+    # This test is about the BINDING's contract, so it pins the in-process path.
+    # The isolated path — the default, and what actually runs — is covered by the
+    # tests below.
+    monkeypatch.setattr(dec.settings, "sdk_isolate", False)
 
     seen: dict[str, object] = {}
 
@@ -444,6 +451,27 @@ def test_classify_archive_key_separates_a_real_key_from_rejection_bytes():
 
     assert archive_key_is_plausible(b"") is False
     assert archive_key_is_plausible(b"\x00" * 32) is False
+
+
+def test_a_real_eighty_eight_character_key_is_accepted():
+    """The live key is **88** printable characters — measured, not assumed.
+
+    An earlier version of this guard capped the length at 64, so it would have
+    rejected the real key and reported a mismatch that did not exist: the exact
+    confidently-wrong message the rest of this module exists to prevent. It was
+    dormant only because the guard sits on the `sdk` path and the provider was
+    `pure`. The discriminator is printability, so the length bound stays loose.
+    """
+    from app.adapters.decrypt import archive_key_is_plausible
+
+    assert archive_key_is_plausible(b"A" * 88) is True, "the measured live shape"
+    assert archive_key_is_plausible(b"x" * 512) is True
+
+    # Still refuses what is genuinely not a key.
+    assert archive_key_is_plausible(b"") is False
+    assert archive_key_is_plausible(b"\x00" * 88) is False
+    assert archive_key_is_plausible(bytes(range(88))) is False
+    assert archive_key_is_plausible(b"A" * 2000) is False
 
 
 def test_a_mismatched_private_key_is_caught_before_the_native_call(monkeypatch, tmpdir):
@@ -509,11 +537,174 @@ def test_probe_entry_shape_measures_whether_the_key_matches(monkeypatch, tmpdir)
     assert good["archive_key_printable_ascii"] is True
 
     bad = dec.probe_entry_shape({"seq": 1, "encrypt_random_key": mismatched})
-    assert bad["archive_key_printable_ascii"] is False
+    # Which shape a mismatch takes depends on the platform's OpenSSL: older
+    # versions raise on bad padding, 3.2+ implicitly reject and hand back
+    # non-printable bytes. Both must be reported, and NEITHER may read as a match.
+    assert bad.get("archive_key_printable_ascii") is not True
+    assert "archive_key_error" in bad or bad.get("archive_key_printable_ascii") is False
 
     # A field that cannot be decrypted at all is reported, never raised on.
     broken = dec.probe_entry_shape({"seq": 1, "encrypt_random_key": "!!!not base64!!!"})
     assert "archive_key_error" in broken
+
+
+# ---------------------------------------------------------------------------
+# Running the vendor SDK out of process
+# ---------------------------------------------------------------------------
+
+
+def test_the_isolated_path_sends_the_rsa_decrypted_key(monkeypatch, tmpdir):
+    """The default path hands the CHILD the decrypted key, never the base64 field.
+
+    The RSA step stays in the parent on purpose: it is pure Python, and keeping it
+    there means the child imports no `cryptography` and no OpenSSL at all — which
+    is the environment the vendor library's own sample runs in.
+    """
+    from app.adapters import decrypt as dec
+    from app.adapters import sdk_process as sp
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = _write_key(tmpdir / "k.pem", key)
+    monkeypatch.setattr(dec.settings, "archive_private_key_path", str(pem))
+    monkeypatch.setattr(dec.settings, "sdk_isolate", True)
+
+    seen: dict[str, object] = {}
+
+    def fake_run(encrypt_key, encrypt_chat_msg, *, sdk_path=None, timeout=60.0):
+        seen["key"] = encrypt_key
+        seen["msg"] = encrypt_chat_msg
+        return '{"msgtype":"text"}'
+
+    monkeypatch.setattr(sp, "run_decrypt", fake_run)
+
+    secret = b"key-envelope"
+    field = base64.b64encode(
+        key.public_key().encrypt(secret, asym_padding.PKCS1v15())
+    ).decode()
+
+    assert dec.SdkDecryptor().decrypt(field, "CIPHERTEXT") == '{"msgtype":"text"}'
+    assert seen["key"] == secret, "the child was given the undecrypted field"
+    assert seen["msg"] == "CIPHERTEXT"
+
+
+def test_a_native_abort_costs_one_entry_not_the_gateway(monkeypatch):
+    """The whole point of the child process.
+
+    `free(): invalid pointer` is a glibc heap abort from inside the vendor blob.
+    In-process it kills the gateway — no `except` catches it, so the container
+    crash-loops and never serves a request. Here the parent sees a signalled child
+    and reports an ordinary failure, and carries the child's stderr (where glibc
+    said why) into the message so it reaches `/wecom/health` instead of dying with
+    the process.
+    """
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=-6, stdout=b"", stderr=b"free(): invalid pointer\n"
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+
+    text = str(e.value)
+    assert "SIGABRT" in text
+    assert "free(): invalid pointer" in text
+    assert "gateway is unaffected" in text
+
+
+def test_a_clean_sdk_error_survives_the_round_trip(monkeypatch):
+    """A refusal from the SDK must arrive as its own message, not as a death."""
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b'{"ok": false, "error": "DecryptData failed: 10006"}',
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg")
+    assert "10006" in str(e.value)
+
+
+def test_a_hung_worker_is_killed_and_reported(monkeypatch):
+    """Otherwise a wedged vendor call blocks the poller forever."""
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="sdk_worker", timeout=kwargs.get("timeout", 1))
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_decrypt(b"key", "msg", timeout=3)
+    assert "did not answer" in str(e.value)
+
+
+def test_the_worker_process_speaks_the_protocol():
+    """The REAL child, with no `.so` involved.
+
+    An unknown op must come back as well-formed JSON. That is what proves the
+    interpreter, the `-m` module path, the fd-1 redirect and the framing all work
+    together — without it, the isolation could be silently broken and every entry
+    would just look like a dead worker.
+    """
+    from app.core.config import REPO_ROOT
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "app.adapters.sdk_worker"],
+        input=b'{"op": "nope"}\n',
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(REPO_ROOT),
+        timeout=120,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-400:]
+    assert json.loads(proc.stdout.decode()) == {
+        "ok": False,
+        "error": "unknown op: 'nope'",
+    }
+
+
+def test_a_vendor_print_on_stdout_cannot_corrupt_the_protocol():
+    """fd 1 is moved to stderr before the library is loaded.
+
+    The vendor blob is C++ with no notion of the protocol, so one stray `printf`
+    to stdout would land inside the response — presenting as a malformed reply
+    rather than as the vendor's print. This pins the redirect that prevents it.
+    """
+    from app.core.config import REPO_ROOT
+
+    program = (
+        "import os, sys;"
+        "from app.adapters.sdk_worker import _redirect_stdout_to_stderr;"
+        "_redirect_stdout_to_stderr();"
+        "sys.stdout.write('NOISE'); sys.stdout.flush();"
+        "os.write(1, b'AFTER')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(REPO_ROOT),
+        timeout=120,
+        check=False,
+    )
+
+    assert proc.stdout == b"", (
+        "fd 1 was not redirected — a vendor print would corrupt the protocol"
+    )
+    assert b"NOISE" in proc.stderr
+    assert b"AFTER" in proc.stderr
 
 
 def test_http_clients_ignore_the_sandbox_proxy():
