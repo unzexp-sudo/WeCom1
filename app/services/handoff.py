@@ -151,6 +151,15 @@ def handoff(
     if not msg.customer_id and response.get("customer_id"):
         # The ERP may resolve the customer itself on a reply/null handoff.
         msg.customer_id = response.get("customer_id")
+        # `bind_status` is a FUNCTION of `customer_id` everywhere else — the
+        # ingestor writes `"bound" if customer_id else "unresolved"`, and §3 of
+        # the contract allows only `bound`|`unresolved`, with `unresolved`
+        # defined as `customer_id = None`. Setting one without the other made
+        # rows that name a customer and report themselves unbound in the same
+        # breath; the operator's "please bind manually" worklist is filtered on
+        # this field, so such a row keeps asking for a binding it already has.
+        # Two rows on production read exactly that way before this line.
+        msg.bind_status = "bound"
     msg.status = "handed_off"
     msg.error = None
 

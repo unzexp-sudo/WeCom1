@@ -218,3 +218,82 @@ def test_handoff_failure_sets_status_failed(db):
     assert msg.status == "failed"
     assert msg.error
     assert result == {} or result.get("status") in (None, "failed")
+
+
+# ---------------------------------------------------------------------------
+# `bind_status` must never contradict `customer_id`
+# ---------------------------------------------------------------------------
+
+
+class ErpResolvesCustomer:
+    """An ERP that answers with a customer the payload did not carry.
+
+    `MockErpClient` cannot exercise this path: it echoes back
+    `payload["customer_id"]`, and the branch below is guarded on
+    `not msg.customer_id` — so the response is only ever truthy when the row
+    already had a customer, and the branch is unreachable. That is why the
+    contradiction survived the whole suite.
+    """
+
+    def __init__(self, customer_id: str) -> None:
+        self.customer_id = customer_id
+        self.calls: list[tuple[str, dict]] = []
+
+    def _fake(self, kind: str, payload: dict) -> dict:
+        self.calls.append((kind, payload))
+        return {
+            "document_id": "doc-erp1",
+            "job_id": "job-erp1",
+            "customer_id": self.customer_id,
+            "status": "queued",
+            "duplicate": False,
+        }
+
+    def intake_wecom(self, payload):
+        return self._fake("intake", payload)
+
+    def intake_reply(self, payload):
+        return self._fake("reply", payload)
+
+
+def test_erp_supplied_customer_also_sets_bind_status(db):
+    """A row naming a customer must not report itself unbound.
+
+    §3 of the contract allows only `bound`|`unresolved`, and defines
+    `unresolved` as `customer_id = None`; the ingestor writes the field as a
+    pure function of `customer_id`. The ERP write-back set one without the
+    other, so a message the ERP HAD resolved still read `unresolved` — and the
+    "please bind manually" worklist is filtered on this field.
+    """
+    msg = make_msg(db)
+    assert msg.customer_id is None
+    assert msg.bind_status == "unresolved"
+
+    handoff.handoff(db, msg, erp=ErpResolvesCustomer("cust-42"))
+
+    db.refresh(msg)
+    assert msg.customer_id == "cust-42"
+    assert msg.bind_status == "bound", (
+        "the row names a customer but reports itself unbound"
+    )
+
+
+def test_erp_supplied_customer_does_not_override_a_bound_row(db):
+    """The write-back only fills a GAP; it never rewrites an existing binding."""
+    msg = make_msg(db, customer_id="cust-mine", bind_status="bound")
+
+    handoff.handoff(db, msg, erp=ErpResolvesCustomer("cust-theirs"))
+
+    db.refresh(msg)
+    assert msg.customer_id == "cust-mine"
+    assert msg.bind_status == "bound"
+
+
+def test_handoff_keeps_the_row_unresolved_when_nobody_resolves(db, mock_erp):
+    """No customer anywhere ⇒ still `unresolved`, and that is not a regression."""
+    msg = make_msg(db)
+    handoff.handoff(db, msg, erp=mock_erp)
+    db.refresh(msg)
+    assert msg.customer_id is None
+    assert msg.bind_status == "unresolved"
+
