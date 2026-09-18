@@ -149,21 +149,12 @@ def _describe_death(returncode: int, stderr: bytes) -> str:
     return f"{lead}{_DEATH_MEANING[lead]}. {how}.{tail}"
 
 
-def run_decrypt(
-    encrypt_key: bytes,
-    encrypt_chat_msg: str,
-    *,
-    sdk_path: str | None = None,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> str:
-    """Decrypt one archive entry in a child process. Raises `SdkWorkerError`."""
-    request = {
-        "op": "decrypt",
-        "key_b64": base64.b64encode(encrypt_key).decode("ascii"),
-        "msg": encrypt_chat_msg,
-        "sdk_path": sdk_path or "",
-    }
+def _run(request: dict, *, timeout: float) -> dict:
+    """Spawn the worker for one request and return its reply.
 
+    Raises `SdkWorkerError` for every way the child can fail to answer: a signal, a
+    timeout, a non-zero exit, or garbage on the wire.
+    """
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "app.adapters.sdk_worker"],
@@ -189,14 +180,49 @@ def run_decrypt(
         raise SdkWorkerError(_describe_death(proc.returncode, proc.stderr))
 
     try:
-        reply = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+        return json.loads(proc.stdout.decode("utf-8", errors="replace"))
     except ValueError as exc:
         raise SdkWorkerError(
             f"the SDK worker answered with something that is not JSON: {exc}"
         ) from exc
+
+
+def run_decrypt(
+    encrypt_key: bytes,
+    encrypt_chat_msg: str,
+    *,
+    sdk_path: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> str:
+    """Decrypt one archive entry in a child process. Raises `SdkWorkerError`."""
+    reply = _run(
+        {
+            "op": "decrypt",
+            "key_b64": base64.b64encode(encrypt_key).decode("ascii"),
+            "msg": encrypt_chat_msg,
+            "sdk_path": sdk_path or "",
+        },
+        timeout=timeout,
+    )
 
     if not reply.get("ok"):
         raise SdkWorkerError(
             str(reply.get("error") or "the SDK worker reported no reason")
         )
     return reply.get("text") or ""
+
+
+def run_probe(*, sdk_path: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Load the library and `Init()` **in a child process**, and report the result.
+
+    Returns the worker's reply verbatim (`ok`, `error`, `reached`), and raises
+    `SdkWorkerError` only if the child died. Deliberately does NOT raise on
+    `ok: False`: a caller that is *diagnosing* the SDK wants the error text and the
+    stage it reached, not an exception.
+
+    This exists so a self-test endpoint never touches the native library in its own
+    process. The blob aborts rather than returning an error, so an in-process probe
+    could kill the gateway — the exact failure the poller's isolation exists to
+    prevent, and a probe must not be able to do what the poller cannot.
+    """
+    return _run({"op": "probe", "sdk_path": sdk_path or ""}, timeout=timeout)

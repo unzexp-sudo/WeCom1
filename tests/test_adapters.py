@@ -817,6 +817,119 @@ def test_the_worker_announces_each_stage_before_the_native_call(monkeypatch):
     ]
 
 
+def test_the_probe_op_stops_after_init_and_reports_the_stage(monkeypatch):
+    """The probe exists so a self-test endpoint never touches the native library in
+    its own process.
+
+    It must stop after `Init()`: running `DecryptData` would need a real message,
+    and the whole point is to answer "can this deployment decrypt at all?" without
+    one.
+    """
+    import types
+
+    from app.adapters import sdk_worker
+
+    events: list[str] = []
+
+    class FakeSdk:
+        path = ""
+
+        def load_library(self):
+            events.append("load_library")
+
+        def load(self):
+            events.append("load")
+
+        def decrypt(self, *_args):  # pragma: no cover - must not be reached
+            events.append("decrypt")
+            return "NO"
+
+    fake = types.ModuleType("app.adapters.wework_sdk")
+    fake.SdkLibraryError = RuntimeError
+    fake.get_sdk = lambda: FakeSdk()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.adapters.wework_sdk", fake)
+    monkeypatch.setattr(sdk_worker, "_stage", lambda name: events.append(f"stage:{name}"))
+
+    reply = sdk_worker.handle({"op": "probe"})
+
+    assert reply == {
+        "ok": True,
+        "reached": "init",
+        "library_loads": True,
+        "init_ok": True,
+    }
+    assert events == ["stage:library", "load_library", "stage:init", "load"]
+
+
+def test_a_failed_probe_reports_the_stage_it_reached(monkeypatch):
+    """`reached` is what lets the caller pick between "wrong platform" and "wrong
+    credentials" without parsing prose — and those two need opposite responses."""
+    import types
+
+    from app.adapters import sdk_worker
+
+    class FakeSdk:
+        path = ""
+
+        def load_library(self):
+            raise RuntimeError("invalid ELF header")
+
+        def load(self):  # pragma: no cover - must not be reached
+            raise AssertionError("load() ran even though load_library() failed")
+
+    fake = types.ModuleType("app.adapters.wework_sdk")
+    fake.SdkLibraryError = RuntimeError
+    fake.get_sdk = lambda: FakeSdk()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.adapters.wework_sdk", fake)
+
+    reply = sdk_worker.handle({"op": "probe"})
+
+    assert reply["ok"] is False
+    assert reply["reached"] == "library"
+    assert "invalid ELF header" in reply["error"]
+
+
+def test_run_probe_returns_the_reply_instead_of_raising(monkeypatch):
+    """Unlike `run_decrypt`, a *reported* failure is data, not an exception: the
+    caller is diagnosing the SDK and wants the error text and the stage."""
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b'{"ok": false, "error": "Init() failed: 10009", "reached": "init"}',
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    reply = sp.run_probe()
+    assert reply["ok"] is False
+    assert "10009" in reply["error"]
+    assert reply["reached"] == "init"
+
+
+def test_run_probe_still_raises_when_the_child_dies(monkeypatch):
+    """A death is not a diagnosis — the caller cannot act on a reply that never
+    arrived, so it must surface as an error like any other."""
+    from app.adapters import sdk_process as sp
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=-6,
+            stdout=b"",
+            stderr=b"[worker] stage=library\nfree(): invalid pointer\n",
+        )
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+
+    with pytest.raises(sp.SdkWorkerError) as e:
+        sp.run_probe()
+    assert "loading the shared library" in str(e.value)
+
+
 def test_the_worker_process_speaks_the_protocol():
     """The REAL child, with no `.so` involved.
 

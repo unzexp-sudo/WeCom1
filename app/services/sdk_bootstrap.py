@@ -18,9 +18,10 @@ is what gets loaded — and it was verified against the vendor's own `md5.txt`,
 which ships inside the archive. Pinning means a rebuild either produces the exact
 library that was tested, or fails loudly.
 
-**Nothing here raises out.** A failure must degrade to "attachments unavailable",
-which `/wecom/health` already warns about, and never to a gateway that will not
-boot — text orders still flow without the SDK.
+**Nothing here raises out.** A failure must degrade to a reported state, never to a
+gateway that will not boot. Note that the SDK is not optional for ingestion: it is
+the only thing that can read the archive envelope, so **without it nothing flows,
+text included** — the failure is loud in `/wecom/health` rather than silent.
 """
 from __future__ import annotations
 

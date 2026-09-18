@@ -673,24 +673,30 @@ def archive_consent(roomid: str | None = Query(default=None)) -> dict:
 
 @router.get("/archive/sdk", dependencies=[Depends(require_service_key)])
 def archive_sdk() -> dict:
-    """Report whether the archive MEDIA path can actually work.
+    """Report whether the archive decryption path can actually work.
 
-    Text needs no SDK: the archive API hands back text that decrypts in pure
-    Python, which is why `pure` is the better default for decryption. Attachments
-    are a different story — `image`, `file`, `voice` and `mixed` can **only** be
-    fetched through WeCom's C library. So a deploy can look completely healthy
-    while every attachment fails, and because `pull_once` holds the cursor on a
-    failed entry, the first attachment then blocks every message behind it.
+    **Correcting a costly falsehood.** This docstring used to say "Text needs no
+    SDK: the archive API hands back text that decrypts in pure Python, which is why
+    `pure` is the better default for decryption." Every part of that is wrong, and
+    it is where the `pure` default came from. `encrypt_chat_msg` is a vendor
+    ENVELOPE, not base64 AES ciphertext, so `pure` fails **every** entry — text
+    included — with "not a multiple of the block length", and no key change can fix
+    it. The vendor's own doc sample is unaligned too (318 chars → mod16 14). There
+    is no text/attachment split: `sdk` is required for both.
 
     Four stages, checked in order, stopping at the first failure so the reason is
     never buried under later ones:
 
     | stage | failure means |
     |---|---|
-    | `provider` | not `sdk` — media is impossible, not broken |
+    | `provider` | not `sdk` — **nothing** ingests, text included |
     | `exists` / `digest_ok` | the library is absent, or is not the one we expect |
     | `library_loads` | wrong platform: it is Linux x86-64, so macOS and arm64 cannot load it |
     | `init_ok` | corpid/secret rejected — the same causes as a failed pull |
+
+    The two native stages run in a CHILD process (`run_probe`), not here: the blob
+    aborts rather than returning an error, so an in-process probe could kill the
+    gateway — the exact failure the poller's isolation exists to prevent.
 
     Guarded, and `Init()` is one authenticated call, so this is deliberately NOT
     part of `/wecom/health` — health is the platform's healthcheck and must stay
@@ -698,7 +704,8 @@ def archive_sdk() -> dict:
     """
     from pathlib import Path
 
-    from app.adapters.wework_sdk import SdkLibraryError, get_sdk, resolved_sdk_path
+    from app.adapters.sdk_process import SdkWorkerError, run_probe
+    from app.adapters.wework_sdk import resolved_sdk_path
     from app.services.sdk_bootstrap import SDK_SO_MD5, verify_sdk_file
 
     path = resolved_sdk_path()
@@ -719,9 +726,11 @@ def archive_sdk() -> dict:
     if provider != "sdk":
         out["error"] = f"WECOM_DECRYPT_PROVIDER is {provider!r}, not 'sdk'"
         out["hint"] = (
-            "Under 'pure' attachments cannot be downloaded at all — this is a "
-            "configuration state, not a fault. Text still ingests normally. Set "
-            "WECOM_DECRYPT_PROVIDER=sdk to enable media."
+            "Under any other provider NOTHING ingests — text included, not just "
+            "attachments. encrypt_chat_msg is a vendor envelope rather than AES "
+            "ciphertext, so this provider fails every entry with 'not a multiple of "
+            "the block length' and no key change can fix it. Set "
+            "WECOM_DECRYPT_PROVIDER=sdk."
         )
         return out
 
@@ -750,39 +759,40 @@ def archive_sdk() -> dict:
         out["hint"] = "Re-fetch with `bash scripts/fetch_sdk.sh` — do not load an unverified library."
         return out
 
-    sdk = get_sdk()
     try:
-        sdk.load_library()
-    except SdkLibraryError as exc:
+        probe = run_probe(sdk_path=path)
+    except SdkWorkerError as exc:
         out["error"] = str(exc)
         out["hint"] = (
-            "The file is present and correct but will not load — that is almost "
-            "always the platform. This library is Linux x86-64 and cannot load "
-            "on macOS or on arm64."
-        )
-        return out
-    except OSError as exc:
-        out["error"] = f"dlopen failed: {exc}"
-        out["hint"] = "The library is present but the loader rejected it."
-        return out
-
-    out["library_loads"] = True
-    try:
-        sdk.load()
-    except SdkLibraryError as exc:
-        out["error"] = str(exc)
-        out["hint"] = (
-            "The library loaded but Init() was rejected. That is a credential "
-            "problem, with the same causes as a failed pull: a wrong "
-            "WECOM_ARCHIVE_SECRET, or this egress IP missing from the archive's "
-            "Trusted IP list (10009)."
+            "The file is present and its digest matches, but the process that "
+            "loaded it died. The message names the stage it reached; an ABI or "
+            "platform fault cannot be fixed from the console."
         )
         return out
 
-    out["init_ok"] = True
+    reached = probe.get("reached")
+    out["library_loads"] = bool(probe.get("library_loads"))
+    out["init_ok"] = bool(probe.get("init_ok"))
+    if not probe.get("ok"):
+        out["error"] = str(probe.get("error") or "the SDK probe failed")
+        if reached == "library":
+            out["hint"] = (
+                "The file is present and correct but will not load — that is almost "
+                "always the platform. This library is Linux x86-64 and cannot load "
+                "on macOS or on arm64."
+            )
+        else:
+            out["hint"] = (
+                "The library loaded but Init() was rejected. That is a credential "
+                "problem, with the same causes as a failed pull: a wrong "
+                "WECOM_ARCHIVE_SECRET, or this egress IP missing from the archive's "
+                "Trusted IP list (10009)."
+            )
+        return out
+
     out["ok"] = True
     out["hint"] = (
-        "The SDK is loaded and Init() succeeded, so attachments can be fetched. "
-        "Send an image or a file from an in-scope account to prove the download."
+        "The SDK is loaded and Init() succeeded, so the decryption path is usable. "
+        "Send a message from an in-scope account to prove the round trip end to end."
     )
     return out

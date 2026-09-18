@@ -183,13 +183,13 @@ def _config_readiness() -> dict:
     provider = (settings.decrypt_provider or "pure").strip().lower()
     if provider != "sdk":
         warnings.append(
-            f"WECOM_DECRYPT_PROVIDER is {provider!r}, so archived ATTACHMENTS "
-            "cannot be downloaded. Text still ingests, but the first image/file/"
-            "voice message will fail, and a failed entry HOLDS THE ARCHIVE "
-            "CURSOR — blocking every later message behind it. Clear it with "
-            "POST /wecom/messages/{id}/rehand once this is fixed. Set the "
-            "provider to 'sdk' before real orders, which are attachments, start "
-            "arriving."
+            f"WECOM_DECRYPT_PROVIDER is {provider!r}, so NOTHING can be ingested — "
+            "this is not limited to attachments. encrypt_chat_msg is a vendor "
+            "envelope rather than AES ciphertext, so this provider fails EVERY "
+            "entry, text included, with 'not a multiple of the block length', and "
+            "no key change can fix it. The archive cursor stays at 0 while this is "
+            "set, so the pull reports fetched: 0 — which is byte-identical to a "
+            "genuinely empty archive. Set WECOM_DECRYPT_PROVIDER=sdk."
         )
     elif not os.path.exists(sdk_path or ""):
         # The provider is right but the library is not on disk. The boot

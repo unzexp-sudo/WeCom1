@@ -108,25 +108,26 @@ def test_health_points_at_the_gate_switch_when_it_is_off(client, monkeypatch):
     assert not any("fails OPEN" in w for w in warnings)
 
 
-def test_health_warns_that_pure_cannot_download_attachments(client, monkeypatch):
-    """`pure` decrypts messages but cannot fetch media, and a failed entry holds
-    the archive cursor — so the first attachment blocks everything behind it.
-    Health has to say this *before* it happens, because the symptom (a stalled
-    cursor) points nowhere near the cause.
+def test_health_warns_that_a_non_sdk_provider_ingests_nothing(client, monkeypatch):
+    """A non-`sdk` provider ingests NOTHING — not merely attachments.
+
+    This test previously asserted the warning said "archived ATTACHMENTS cannot be
+    downloaded. Text still ingests". That was false, and believing it is what put
+    `pure` into the deployed variables: `encrypt_chat_msg` is a vendor envelope, so
+    `pure` fails every entry, text included, and the cursor never leaves 0. Health
+    has to say so *before* it happens, because the symptom — `fetched: 0`, which is
+    byte-identical to an empty archive — points nowhere near the cause.
     """
     monkeypatch.setattr(settings, "decrypt_provider", "pure")
 
     body = client.get("/wecom/health").json()
     warnings = body["config"]["warnings"]
-    assert any("ATTACHMENTS" in w for w in warnings)
-    assert any("HOLDS THE ARCHIVE CURSOR" in w for w in warnings)
-    # The warning must name a route that actually works. It used to say rehand
-    # "repeats the same download" and could not clear the block — which was true
-    # until rehand learned to re-download.
-    assert any("rehand" in w for w in warnings), (
-        "the warning must tell the operator how to clear the held cursor"
-    )
-    assert not any("unable to clear" in w for w in warnings)
+    assert any("NOTHING can be ingested" in w for w in warnings)
+    assert any("no key change can fix it" in w for w in warnings)
+    assert any("byte-identical to a genuinely empty archive" in w for w in warnings)
+    assert any("WECOM_DECRYPT_PROVIDER=sdk" in w for w in warnings)
+    # The old claim, which sent operators looking at attachments and keys.
+    assert not any("Text still ingests" in w for w in warnings)
     # Under `pure` the SDK is irrelevant, but a path is still *in effect* —
     # autofetch would write there if the provider changed. Reporting the raw
     # setting here made a correctly configured `sdk` deploy read as
@@ -589,10 +590,16 @@ def test_archive_sdk_is_guarded(client, monkeypatch):
     assert client.get("/wecom/archive/sdk").status_code == 401
 
 
-def test_archive_sdk_names_pure_as_a_config_state_not_a_fault(client, monkeypatch):
-    """Under `pure` the answer is "media is impossible here", not "media is
-    broken" — those lead to different actions, and `ok: false` alone conflates
-    them."""
+def test_archive_sdk_names_pure_as_a_config_state_that_ingests_nothing(
+    client, monkeypatch
+):
+    """Under a non-`sdk` provider the answer is "nothing can ingest here", not
+    "media is broken" — those lead to different actions, and `ok: false` alone
+    conflates them.
+
+    The hint used to say "Text still ingests normally", which is false and is the
+    belief that produced the misconfiguration in the first place.
+    """
     monkeypatch.setattr(settings, "decrypt_provider", "pure")
 
     body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
@@ -600,7 +607,9 @@ def test_archive_sdk_names_pure_as_a_config_state_not_a_fault(client, monkeypatc
     assert body["ok"] is False
     assert body["provider"] == "pure"
     assert "WECOM_DECRYPT_PROVIDER" in body["error"]
-    assert "not a fault" in body["hint"]
+    assert "NOTHING ingests" in body["hint"]
+    assert "no key change can fix it" in body["hint"]
+    assert "Text still ingests" not in body["hint"]
     # And it must stop here rather than reporting a missing file as the reason.
     assert body["exists"] is False
 
@@ -638,25 +647,29 @@ def test_archive_sdk_separates_a_load_failure_from_an_init_failure(
     client, monkeypatch, tmp_path
 ):
     """The two stages have completely different fixes — wrong platform vs. wrong
-    credentials — so the probe has to say which one happened."""
-    from app.adapters.wework_sdk import SdkLibraryError
+    credentials — so the probe has to say which one happened.
 
+    The endpoint now runs those native calls in a CHILD process (`run_probe`), so
+    this patches the child boundary rather than `get_sdk`. That is the point: an
+    in-process probe could be killed by the vendor blob, and a probe must not be
+    able to do what the poller's isolation exists to prevent.
+    """
     monkeypatch.setattr(settings, "decrypt_provider", "sdk")
     p = tmp_path / "libWeWorkFinanceSdk_C.so"
     p.write_bytes(b"whatever, the digest check is stubbed")
     _patch_sdk_path(monkeypatch, str(p))
     monkeypatch.setattr("app.services.sdk_bootstrap.verify_sdk_file", lambda _p: (True, None))
 
-    class _Sdk:
-        def load_library(self):
-            raise SdkLibraryError("invalid ELF header")
+    import app.adapters.sdk_process as sp
 
-        def load(self):  # pragma: no cover - must not be reached
-            raise AssertionError("load() ran even though load_library() failed")
+    def fake_probe(**_kwargs):
+        return {
+            "ok": False,
+            "error": "invalid ELF header",
+            "reached": "library",
+        }
 
-    import app.adapters.wework_sdk as ws
-
-    monkeypatch.setattr(ws, "get_sdk", lambda: _Sdk())
+    monkeypatch.setattr(sp, "run_probe", fake_probe)
 
     body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
 
@@ -667,6 +680,69 @@ def test_archive_sdk_separates_a_load_failure_from_an_init_failure(
     assert "Linux x86-64" in body["hint"]
 
 
+def test_archive_sdk_names_an_init_rejection_as_a_credential_fault(
+    client, monkeypatch, tmp_path
+):
+    """Same isolation boundary, the other stage: `reached: init` means the library
+    loaded, so the fault is the secret or the Trusted IP list."""
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    p = tmp_path / "libWeWorkFinanceSdk_C.so"
+    p.write_bytes(b"stub")
+    _patch_sdk_path(monkeypatch, str(p))
+    monkeypatch.setattr("app.services.sdk_bootstrap.verify_sdk_file", lambda _p: (True, None))
+
+    import app.adapters.sdk_process as sp
+
+    monkeypatch.setattr(
+        sp,
+        "run_probe",
+        lambda **_kwargs: {
+            "ok": False,
+            "error": "Init() failed: 10009 (ip非法)",
+            "reached": "init",
+            "library_loads": True,
+        },
+    )
+
+    body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
+
+    assert body["library_loads"] is True
+    assert body["init_ok"] is False
+    assert "Trusted IP" in body["hint"]
+    assert "Linux x86-64" not in body["hint"]
+
+
+def test_archive_sdk_survives_the_worker_dying(client, monkeypatch, tmp_path):
+    """A probe must never take the gateway down with it.
+
+    The vendor blob aborts the process instead of returning an error, so the probe
+    runs in a child. If that child dies the endpoint must report it as a normal
+    failure — not 500, and above all not die itself.
+    """
+    monkeypatch.setattr(settings, "decrypt_provider", "sdk")
+    p = tmp_path / "libWeWorkFinanceSdk_C.so"
+    p.write_bytes(b"stub")
+    _patch_sdk_path(monkeypatch, str(p))
+    monkeypatch.setattr("app.services.sdk_bootstrap.verify_sdk_file", lambda _p: (True, None))
+
+    import app.adapters.sdk_process as sp
+
+    def boom(**_kwargs):
+        raise sp.SdkWorkerError(
+            "the SDK worker died while loading the shared library — ABI fault"
+        )
+
+    monkeypatch.setattr(sp, "run_probe", boom)
+
+    resp = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS)
+
+    assert resp.status_code == 200, "a probe failure must not 500"
+    body = resp.json()
+    assert body["ok"] is False
+    assert "ABI fault" in body["error"]
+    assert "cannot be fixed from the console" in body["hint"]
+
+
 def test_archive_sdk_reports_a_successful_init(client, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "decrypt_provider", "sdk")
     p = tmp_path / "libWeWorkFinanceSdk_C.so"
@@ -674,16 +750,18 @@ def test_archive_sdk_reports_a_successful_init(client, monkeypatch, tmp_path):
     _patch_sdk_path(monkeypatch, str(p))
     monkeypatch.setattr("app.services.sdk_bootstrap.verify_sdk_file", lambda _p: (True, None))
 
-    class _Sdk:
-        def load_library(self):
-            return object()
+    import app.adapters.sdk_process as sp
 
-        def load(self):
-            return object()
-
-    import app.adapters.wework_sdk as ws
-
-    monkeypatch.setattr(ws, "get_sdk", lambda: _Sdk())
+    monkeypatch.setattr(
+        sp,
+        "run_probe",
+        lambda **_kwargs: {
+            "ok": True,
+            "reached": "init",
+            "library_loads": True,
+            "init_ok": True,
+        },
+    )
 
     body = client.get("/wecom/archive/sdk", headers=GATEWAY_HEADERS).json()
 

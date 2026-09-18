@@ -35,6 +35,12 @@ import sys
 # The fd the protocol is written to. `_redirect_stdout` moves it off fd 1.
 _PROTO_FD = 1
 
+# The stage most recently announced. Reported back in a failure reply so the caller
+# can tell "the library would not load" from "the credential was rejected" without
+# parsing prose — those two need opposite responses, and a probe endpoint has to
+# distinguish them.
+_LAST_STAGE: str | None = None
+
 
 def _redirect_stdout_to_stderr() -> None:
     """Keep the protocol off fd 1, because a vendor library may print there.
@@ -61,22 +67,32 @@ def _stage(name: str) -> None:
     child died. The last marker standing is therefore the whole answer to "which
     native call did it?" — and that distinction decides the fix, because an
     `Init()` abort fails every entry identically while a `DecryptData` abort is
-    per-message. See `sdk_process._STAGE_MEANING`.
+    per-message. See `sdk_process._DEATH_MEANING`.
     """
+    global _LAST_STAGE
+    _LAST_STAGE = name
     print(f"[worker] stage={name}", file=sys.stderr, flush=True)
 
 
 def handle(request: dict) -> dict:
-    """Answer one request. Never raises — the parent must always get a reply."""
+    """Answer one request. Never raises — the parent must always get a reply.
+
+    Two ops. `decrypt` does the whole path. `probe` stops after `Init()` and reports
+    which stage it reached, so a caller can check that the library loads and the
+    credentials are accepted **without** needing a real message — and without doing
+    it in its own process, where an abort would take the service down.
+    """
     op = request.get("op")
 
-    if op != "decrypt":
+    if op not in ("decrypt", "probe"):
         return {"ok": False, "error": f"unknown op: {op!r}"}
 
-    try:
-        key = base64.b64decode(request.get("key_b64") or "")
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"key_b64 is not valid base64: {exc}"}
+    key = b""
+    if op == "decrypt":
+        try:
+            key = base64.b64decode(request.get("key_b64") or "")
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"key_b64 is not valid base64: {exc}"}
 
     try:
         from app.adapters.wework_sdk import SdkLibraryError, get_sdk
@@ -94,12 +110,18 @@ def handle(request: dict) -> dict:
         sdk.load_library()
         _stage("init")
         sdk.load()
+        if op == "probe":
+            return {"ok": True, "reached": "init", "library_loads": True, "init_ok": True}
         _stage("decrypt")
         return {"ok": True, "text": sdk.decrypt(key, request.get("msg") or "")}
     except SdkLibraryError as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "reached": _LAST_STAGE}
     except Exception as exc:  # noqa: BLE001 - report, never die quietly
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "reached": _LAST_STAGE,
+        }
 
 
 def main() -> int:
