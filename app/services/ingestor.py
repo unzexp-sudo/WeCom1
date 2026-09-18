@@ -276,11 +276,26 @@ def _store_media(row, *, sdkfileid: str, filename: str | None, msgtype: str, api
     `source_type`, or a retried attachment would land under a different type
     than the one the first attempt would have produced.
     """
-    from app.adapters.storage import guess_mime
+    from app.adapters.storage import guess_mime, sniff_media
 
     content, saved_name = api.download_media(sdkfileid, filename)
     name = saved_name or filename or sdkfileid
-    mime = guess_mime(name)
+    # The archive's image payload carries no filename, so `normalize_entry`
+    # synthesises `<msgid>.jpg` for every image — which means a PNG sent by a
+    # customer was stored, and served, as `image/jpeg`. The bytes are the only
+    # authority on what a blob is, so let them correct the label.
+    #
+    # A recognised signature wins outright; anything unrecognised keeps the
+    # existing extension-based mime, so this can only ever correct a name, never
+    # invent one. Both the ingest path and the retry path share this function
+    # precisely so a retry cannot land a different name than the first attempt.
+    sniffed = sniff_media(content)
+    if sniffed is None:
+        mime = guess_mime(name)
+    else:
+        ext, mime = sniffed
+        if Path(name).suffix.lower() != ext:
+            name = f"{Path(name).stem or 'file'}{ext}"
     path, url = storage.save(name, content, mime)
     row.file_path = path
     row.file_url = url
