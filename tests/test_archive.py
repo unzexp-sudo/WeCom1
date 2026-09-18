@@ -243,6 +243,29 @@ def test_a_failed_pull_is_recorded_with_its_reason(db):
     assert "60020" in last["error"]
 
 
+def test_the_hint_carries_the_first_decryption_error(db):
+    """The exception text is the only thing that separates "wrong key" from
+    "unusable key" — two causes that report identical counters. Leaving it in the
+    container log is what makes the operator guess."""
+
+    class _AllUndecryptable:
+        def __init__(self) -> None:
+            self.last_pull_stats = {
+                "raw_count": 3,
+                "decrypt_failed": 3,
+                "failed_seqs": [1, 2, 3],
+                "first_error": "ValueError: Ciphertext length must be equal to key size",
+            }
+
+        def get_chat_data(self, seq, limit, timeout):
+            return []
+
+    summary = archive.pull_once(db, api=_AllUndecryptable())
+
+    assert summary["hint"] is not None
+    assert "Ciphertext length" in summary["hint"]
+
+
 def test_pull_once_claims_no_decryption_failure_when_the_adapter_is_silent(db):
     """An adapter that predates `last_pull_stats` (or a test fake) must not be
     reported as having decryption failures it never mentioned."""

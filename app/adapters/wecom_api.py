@@ -377,6 +377,12 @@ class RealWeComApi:
             "raw_count": len(chatdata),
             "decrypt_failed": decrypt_failed,
             "failed_seqs": failed_seqs,
+            # The exception text is what separates the two ways this fails, and
+            # they are otherwise identical from outside the container: the key is
+            # the WRONG KEY (RSA decrypt fails, or the ciphertext length does not
+            # match the modulus) versus the key is not USABLE AT ALL (unreadable
+            # PEM, truncated base64). Carry it out of the adapter.
+            "first_error": first_error,
         }
         if decrypt_failed:
             logger.error(

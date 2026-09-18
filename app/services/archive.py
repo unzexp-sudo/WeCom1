@@ -285,6 +285,14 @@ def pull_once(db, *, api=None, erp=None) -> dict:
     # console is the WRONG place to look for this one — which is the whole
     # reason it is worth a dedicated sentence.
     hint: str | None = None
+    # The exception text separates the two ways a total failure happens, and they
+    # are indistinguishable from outside the container: the key is the WRONG KEY
+    # (RSA decrypt fails, or the ciphertext length does not match the modulus)
+    # versus the key is not USABLE AT ALL (unreadable PEM, truncated base64).
+    # Carrying it into the hint means the operator does not have to go and find
+    # the container log to tell them apart.
+    first_error = stats.get("first_error")
+    suffix = f" First failure: {first_error}" if first_error else ""
     if raw_count and not entries:
         hint = (
             f"WeCom returned {raw_count} archived entr(ies) and NONE could be "
@@ -297,7 +305,7 @@ def pull_once(db, *, api=None, erp=None) -> dict:
             "'Archive decryption failed' in the gateway logs. The cursor is "
             "being held, so nothing is lost while you fix it — but nothing "
             "arrives either."
-        )
+        ) + suffix
     elif decrypt_failed:
         hint = (
             f"{decrypt_failed} of {raw_count} archived entr(ies) failed to "
@@ -306,7 +314,7 @@ def pull_once(db, *, api=None, erp=None) -> dict:
             "Message Archiving page partway through this window. The cursor is "
             "held below the first unreadable entry, so the entries behind it "
             "are retried rather than stepped over."
-        )
+        ) + suffix
 
     logger.info(
         "Archive pull seq>%s: raw=%s fetched=%s ingested=%s skipped=%s failed=%s "

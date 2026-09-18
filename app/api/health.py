@@ -223,6 +223,17 @@ def _config_readiness() -> dict:
             "a mismatch 401s every handoff."
         )
 
+    # A total decryption failure has two causes that look identical from outside
+    # — the key is not the one whose public half is set on the Message Archiving
+    # page, or the key on disk is not usable at all — and both report the same
+    # `raw_count: N, decrypt_failed: N`. Reporting a short fingerprint of the
+    # PUBLIC half lets the first be confirmed by comparison instead of by reading
+    # container logs. Nothing secret is exposed: the public key is uploaded to
+    # WeCom by definition, and a hash of it is not key material.
+    from app.adapters.decrypt import private_key_fingerprint
+
+    key_fingerprint, key_bits, key_error = private_key_fingerprint()
+
     return {
         "staff_userids_count": len(staff),
         "order_group_ids_count": len(groups),
@@ -238,6 +249,9 @@ def _config_readiness() -> dict:
         "archive_private_key_b64_set": bool(
             (settings.archive_private_key_b64 or "").strip()
         ),
+        "archive_private_key_fingerprint": key_fingerprint,
+        "archive_private_key_bits": key_bits,
+        "archive_private_key_error": key_error,
         "decrypt_provider": settings.decrypt_provider,
         # The path in effect, plus where it came from and whether the file is
         # actually there. `archive_sdk_path_set` keeps its name so existing

@@ -258,6 +258,67 @@ def test_pure_decryptor_round_trip(tmpdir):
         PureCryptoDecryptor(private_key_path=str(pem)).decrypt("not-base64!!", "x")
 
 
+def _write_key(path, key):
+    path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    return path
+
+
+def test_private_key_fingerprint_identifies_the_key_in_use(tmpdir):
+    """A total decryption failure is caused either by the WRONG key or by an
+    UNUSABLE key, and both report `raw_count: N, decrypt_failed: N`. The
+    fingerprint is what lets the first be settled by comparison — from the health
+    endpoint, without going to find the container log."""
+    from app.adapters.decrypt import private_key_fingerprint
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = _write_key(tmpdir / "archive.pem", key)
+
+    fingerprint, bits, error = private_key_fingerprint(str(pem))
+
+    assert error is None
+    assert bits == 2048
+    assert fingerprint is not None and len(fingerprint) == 16
+    # Deterministic, and derived from the PUBLIC half only — it identifies the
+    # key without revealing anything that is not already uploaded to WeCom.
+    assert private_key_fingerprint(str(pem))[0] == fingerprint
+
+
+def test_two_different_keys_cannot_share_a_fingerprint(tmpdir):
+    """The comparison is only useful if distinct keys give distinct prints."""
+    from app.adapters.decrypt import private_key_fingerprint
+
+    prints = set()
+    for name in ("a.pem", "b.pem"):
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        prints.add(private_key_fingerprint(str(_write_key(tmpdir / name, key)))[0])
+    assert len(prints) == 2
+
+
+def test_an_unusable_key_is_named_and_never_raises(tmpdir):
+    """A truncated base64 blob must report WHY — this runs from a health probe."""
+    from app.adapters.decrypt import private_key_fingerprint
+
+    broken = tmpdir / "broken.pem"
+    broken.write_bytes(
+        b"-----BEGIN PRIVATE KEY-----\nnotbase64\n-----END PRIVATE KEY-----\n"
+    )
+
+    fingerprint, bits, error = private_key_fingerprint(str(broken))
+    assert fingerprint is None
+    assert bits is None
+    assert error is not None
+
+    missing = private_key_fingerprint(str(tmpdir / "nope.pem"))
+    assert missing[0] is None
+    assert "not found" in missing[2]
+
+
 def test_http_clients_ignore_the_sandbox_proxy():
     """§2 — every outbound call must bypass the proxy env (loopback ERP)."""
     for factory in (wa._client, ec._client):
@@ -388,11 +449,14 @@ def test_get_chat_data_counts_the_entries_it_could_not_decrypt(monkeypatch):
     # Nothing survived, so the caller sees an empty list...
     assert entries == []
     # ...but the adapter says WHY, which is the whole point. `failed_seqs` is
-    # what stops the cursor stepping over an entry nobody could read.
+    # what stops the cursor stepping over an entry nobody could read, and
+    # `first_error` is what separates "the wrong key" from "an unusable key" —
+    # two causes that are otherwise identical from outside the container.
     assert api.last_pull_stats == {
         "raw_count": 2,
         "decrypt_failed": 2,
         "failed_seqs": [1, 2],
+        "first_error": "DecryptError: RSA decrypt failed: the key does not match this blob",
     }
 
 

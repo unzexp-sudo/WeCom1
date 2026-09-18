@@ -167,3 +167,44 @@ def decrypt_entry(entry: dict[str, Any], decryptor: Decryptor | None = None) -> 
     except json.JSONDecodeError:
         logger.warning("Archive entry decrypted to non-JSON content: %.200s", text)
         return {"_raw": text}
+
+
+def private_key_fingerprint(
+    path: str | None = None,
+) -> tuple[str | None, int | None, str | None]:
+    """`(fingerprint, key_size, error)` for the archive private key on disk.
+
+    A total decryption failure has two causes that are indistinguishable from
+    outside the container: the key is not the one whose public half is set on the
+    Message Archiving page, or the key on disk is not usable at all (a truncated
+    base64 blob, the wrong PEM type). Both report `raw_count: N,
+    decrypt_failed: N`, and the only thing that told them apart was the exception
+    text in the container log.
+
+    Returning a short fingerprint of the PUBLIC half makes the first case
+    checkable by comparison — the operator can see whether the key the container
+    holds is the key they think they uploaded. Nothing secret leaves here: the
+    public key is uploaded to WeCom by definition, and a hash of it is not key
+    material. Never raises — this is called from a health probe.
+    """
+    import hashlib
+
+    from cryptography.hazmat.primitives import serialization
+
+    raw = (path if path is not None else (settings.archive_private_key_path or "")).strip()
+    if not raw:
+        return None, None, "no private key path is configured"
+    p = Path(raw)
+    if not p.exists():
+        return None, None, f"not found: {p}"
+    try:
+        key = serialization.load_pem_private_key(p.read_bytes(), password=None)
+    except Exception as exc:  # noqa: BLE001 - report, never raise from a probe
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    der = key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    fingerprint = base64.b64encode(hashlib.sha256(der).digest()).decode()
+    return fingerprint[:16], getattr(key, "key_size", None), None
