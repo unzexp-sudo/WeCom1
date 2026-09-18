@@ -24,6 +24,23 @@ from app.core.database import init_db
 
 logger = logging.getLogger("wecom.gateway")
 
+# Without this, none of the app's own logging reaches the platform. uvicorn
+# installs handlers for `uvicorn.*` only, the root logger has none, and `wecom.*`
+# records therefore fall through to Python's last-resort handler, which prints
+# WARNING+ with no timestamp and no logger name. A crash-looping container then
+# shows nothing but uvicorn's four startup lines — no "Archive poller started",
+# no SDK bootstrap progress, no "Failed to decrypt archive entry" — which is the
+# blind spot that made the last two rounds of diagnosis guesswork.
+#
+# `force=True` because the root logger may already carry a handler we did not
+# install, and silently deferring to it is how INFO goes missing again. uvicorn's
+# own loggers set propagate=False, so its output is not duplicated.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    force=True,
+)
+
 MEDIA_ROOT = Path(settings.media_dir)
 
 

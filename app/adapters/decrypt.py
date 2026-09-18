@@ -98,7 +98,62 @@ def rsa_decrypt_random_key(encrypt_random_key: str, path: str | None = None) -> 
     except (binascii.Error, ValueError) as exc:
         raise DecryptError(f"encrypt_random_key is not valid base64: {exc}") from exc
 
-    return load_archive_private_key(path).decrypt(blob, asym_padding.PKCS1v15())
+    try:
+        return load_archive_private_key(path).decrypt(blob, asym_padding.PKCS1v15())
+    except ValueError as exc:
+        # OpenSSL < 3.2 raises here; 3.2+ implicitly rejects and returns garbage
+        # instead (which `archive_key_is_plausible` catches). Same meaning either
+        # way, so give it the same type and the same sentence — a caller should
+        # not have to know which OpenSSL it runs on to name this fault.
+        raise DecryptError(
+            "The archive private key does not match the public key the Message "
+            f"Archiving console is encrypting with (RSA padding rejected: {exc})."
+        ) from exc
+
+
+def classify_archive_key(key: bytes) -> dict[str, Any]:
+    """Non-secret facts about the RSA-decrypted `encrypt_random_key`.
+
+    This is the measurement that replaces a false inference. **A wrong private key
+    does not raise**: OpenSSL 3.2+ implements implicit rejection for PKCS#1 v1.5,
+    so `decrypt()` returns pseudorandom bytes on a padding failure rather than
+    failing, and every layer above then treats that garbage as a real key. "The
+    RSA step succeeded, therefore the key matches" is not evidence — and nothing
+    in this codebase ever measured it, which is how a key mismatch stayed
+    invisible through several rounds of diagnosis.
+
+    WeCom's `encrypt_key` is a `const char *` in the vendor API, and the vendor's
+    own `tool_testSdk.cpp` passes it as a command-line argument — so a real one is
+    a short, NUL-free, printable string. Pseudorandom bytes are neither printable
+    nor, with ~12% probability over 32 bytes, NUL-free.
+
+    Returns a length and two booleans — never the bytes — so it is safe to publish.
+    """
+    return {
+        "archive_key_length": len(key),
+        "archive_key_printable_ascii": bool(key)
+        and all(0x20 <= b <= 0x7E for b in key),
+        "archive_key_has_nul": b"\x00" in key,
+    }
+
+
+def archive_key_is_plausible(key: bytes) -> bool:
+    """Whether `key` can be a real WeCom `encrypt_key`.
+
+    Used as a guard *before* the native decrypt, and the reason is not hygiene.
+    The vendor library does not return an error when it is handed a key it cannot
+    parse — it aborts the entire process (`free(): invalid pointer`, exit 133),
+    which no Python `except` can catch. So an implicit-rejection key is not "one
+    message that failed to decrypt", it is a dead container. Refusing here turns
+    that back into an ordinary `DecryptError`, which the poller holds the cursor
+    on and the health hint can explain.
+    """
+    shape = classify_archive_key(key)
+    return (
+        bool(key)
+        and 8 <= shape["archive_key_length"] <= 64
+        and shape["archive_key_printable_ascii"]
+    )
 
 
 class PureCryptoDecryptor:
@@ -211,6 +266,25 @@ class SdkDecryptor:
         # not the base64 field. See `rsa_decrypt_random_key`.
         encrypt_key = rsa_decrypt_random_key(encrypt_random_key)
 
+        # Refuse BEFORE the native call. To the vendor library a key produced by
+        # implicit rejection is not a decryption failure, it is a heap abort that
+        # takes the whole gateway down (see `archive_key_is_plausible`), and no
+        # `except` here could catch it. This is the difference between "the poller
+        # logs a bad key and holds the cursor" and "the service never boots".
+        if not archive_key_is_plausible(encrypt_key):
+            shape = classify_archive_key(encrypt_key)
+            raise DecryptError(
+                "The archive private key does not match the public key the "
+                "Message Archiving console is encrypting with. The RSA step "
+                f"returned {shape['archive_key_length']} byte(s) that are not a "
+                "printable string, which is what OpenSSL 3.2+ implicit rejection "
+                "returns instead of raising. Refused to hand it to the SDK: the "
+                "vendor library aborts the process on a key it cannot parse. "
+                "Re-upload the public half of this key pair on the Message "
+                "Archiving page, or point WECOM_ARCHIVE_PRIVATE_KEY_B64 at the "
+                "private key matching the public key already there."
+            )
+
         try:
             return sdk.decrypt(encrypt_key, encrypt_chat_msg)
         except SdkLibraryError as exc:
@@ -303,8 +377,14 @@ def probe_entry_shape(entry: dict[str, Any]) -> dict[str, Any]:
     Because the last one is silent, "the RSA step succeeded, so the key must
     match" is a **false inference** — do not make it. Measure the shape instead.
 
-    Lengths, field names and `publickey_ver` only: no ciphertext, no key, no
-    decrypted content. Safe to publish on a health endpoint.
+    The third cause is now **measured rather than inferred**. The RSA step is pure
+    Python, so this probe decrypts `encrypt_random_key` and reports whether the
+    result looks like a real WeCom key. That separates "the key matches" from "a
+    mismatch that implicit rejection disguised", and it keeps working when the SDK
+    will not load at all — which is exactly when it is needed.
+
+    Lengths, field names, `publickey_ver` and classification booleans only: no
+    ciphertext, no key bytes, no decrypted content. Safe on a health endpoint.
     """
     def _decoded_len(value: Any) -> int | str | None:
         if not isinstance(value, str) or not value:
@@ -318,6 +398,18 @@ def probe_entry_shape(entry: dict[str, Any]) -> dict[str, Any]:
     chat_msg = entry.get("encrypt_chat_msg")
     msg_len = _decoded_len(chat_msg)
 
+    # The one thing the length fields cannot tell you: whether the private key we
+    # hold actually matches the public key the console encrypts with. Pure Python,
+    # so it works even when the SDK will not load — which is exactly when it is
+    # needed. Never raises: a probe that breaks the health endpoint is worse than
+    # no probe.
+    try:
+        key_facts: dict[str, Any] = classify_archive_key(
+            rsa_decrypt_random_key(random_key or "")
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never propagate
+        key_facts = {"archive_key_error": f"{type(exc).__name__}: {exc}"}
+
     return {
         "keys_present": sorted(entry),
         "publickey_ver": entry.get("publickey_ver"),
@@ -329,4 +421,5 @@ def probe_entry_shape(entry: dict[str, Any]) -> dict[str, Any]:
         # The tell for the key-independent failure: a non-zero remainder here
         # cannot be fixed by changing the key.
         "encrypt_chat_msg_mod16": msg_len % 16 if isinstance(msg_len, int) else None,
+        **key_facts,
     }

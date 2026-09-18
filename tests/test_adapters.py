@@ -421,6 +421,101 @@ def test_sdk_decryptor_does_the_rsa_step_the_binding_will_not(monkeypatch, tmpdi
     assert seen["encrypt_msg"] == "CIPHERTEXT"
 
 
+def test_classify_archive_key_separates_a_real_key_from_rejection_bytes():
+    """The measurement that was missing through several rounds of diagnosis.
+
+    A real WeCom `encrypt_key` is a printable string — the vendor API takes a
+    `const char *` and the vendor's own sample passes it as a command-line
+    argument. What implicit rejection returns instead is pseudorandom, so it is
+    neither printable nor reliably NUL-free. Nothing distinguished the two before
+    this, which is why "the RSA step succeeded" kept being read as "the key is
+    right".
+    """
+    from app.adapters.decrypt import archive_key_is_plausible, classify_archive_key
+
+    real = b"dGhpcy1pcy1hLXJlYWwtd2Vjb20ta2V5ISE"
+    assert classify_archive_key(real)["archive_key_printable_ascii"] is True
+    assert classify_archive_key(real)["archive_key_has_nul"] is False
+    assert archive_key_is_plausible(real) is True
+
+    rejection = bytes(range(32))
+    assert classify_archive_key(rejection)["archive_key_printable_ascii"] is False
+    assert archive_key_is_plausible(rejection) is False
+
+    assert archive_key_is_plausible(b"") is False
+    assert archive_key_is_plausible(b"\x00" * 32) is False
+
+
+def test_a_mismatched_private_key_is_caught_before_the_native_call(monkeypatch, tmpdir):
+    """A bad key must not reach the vendor library, because it does not fail there.
+
+    Handed a key it cannot parse, the library aborts the whole process
+    (`free(): invalid pointer`, exit 133) — uncatchable in Python, so the gateway
+    crash-loops instead of holding the cursor on one unreadable entry. The pair
+    here is freshly generated, so the ciphertext was encrypted with a public key
+    our private key does not match: the live situation.
+    """
+    from app.adapters import decrypt as dec
+    from app.adapters import wework_sdk as wws
+
+    ours = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    theirs = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = _write_key(tmpdir / "k.pem", ours)
+    monkeypatch.setattr(dec.settings, "archive_private_key_path", str(pem))
+
+    class _Sdk:
+        path = ""
+
+        def decrypt(self, encrypt_key, encrypt_msg):  # pragma: no cover
+            raise AssertionError("the native decrypt was reached with a bad key")
+
+    monkeypatch.setattr(wws, "get_sdk", lambda: _Sdk())
+
+    field = base64.b64encode(
+        theirs.public_key().encrypt(b"a-real-key-envelope", asym_padding.PKCS1v15())
+    ).decode()
+
+    with pytest.raises(dec.DecryptError) as e:
+        dec.SdkDecryptor().decrypt(field, "CIPHERTEXT")
+
+    # Whichever OpenSSL is in play, the sentence names the same fault: either the
+    # guard fired on rejection bytes, or the padding was rejected outright.
+    assert "does not match the public key" in str(e.value)
+    assert "Message Archiving" in str(e.value)
+
+
+def test_probe_entry_shape_measures_whether_the_key_matches(monkeypatch, tmpdir):
+    """The probe must carry the key verdict, not just lengths.
+
+    It is pure Python, so it still works when the SDK will not load — which is
+    exactly when the answer is needed. And it must never raise: a probe that takes
+    the health endpoint down is worse than no probe.
+    """
+    from app.adapters import decrypt as dec
+
+    ours = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    theirs = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = _write_key(tmpdir / "k.pem", ours)
+    monkeypatch.setattr(dec.settings, "archive_private_key_path", str(pem))
+
+    matching = base64.b64encode(
+        ours.public_key().encrypt(b"a-real-key-envelope", asym_padding.PKCS1v15())
+    ).decode()
+    mismatched = base64.b64encode(
+        theirs.public_key().encrypt(b"a-real-key-envelope", asym_padding.PKCS1v15())
+    ).decode()
+
+    good = dec.probe_entry_shape({"seq": 1, "encrypt_random_key": matching})
+    assert good["archive_key_printable_ascii"] is True
+
+    bad = dec.probe_entry_shape({"seq": 1, "encrypt_random_key": mismatched})
+    assert bad["archive_key_printable_ascii"] is False
+
+    # A field that cannot be decrypted at all is reported, never raised on.
+    broken = dec.probe_entry_shape({"seq": 1, "encrypt_random_key": "!!!not base64!!!"})
+    assert "archive_key_error" in broken
+
+
 def test_http_clients_ignore_the_sandbox_proxy():
     """§2 — every outbound call must bypass the proxy env (loopback ERP)."""
     for factory in (wa._client, ec._client):
@@ -568,6 +663,13 @@ def test_get_chat_data_counts_the_entries_it_could_not_decrypt(monkeypatch):
             "encrypt_chat_msg_b64_chars": 4,
             "encrypt_chat_msg_bytes": 1,
             "encrypt_chat_msg_mod16": 1,
+            # The key verdict, reported rather than raised. No private key is
+            # configured in this test, and the probe says so instead of taking the
+            # health endpoint down with it.
+            "archive_key_error": (
+                "DecryptError: WECOM_ARCHIVE_PRIVATE_KEY_PATH is not set — point it "
+                "at the Session Archive RSA private key PEM"
+            ),
         },
     }
 
