@@ -28,6 +28,40 @@ def test_ensure_fixture_files_is_idempotent():
     }
 
 
+def test_the_xlsx_fixture_does_not_depend_on_the_clock(monkeypatch):
+    """A zip entry with no explicit timestamp is stamped with *now*.
+
+    That made `order-sample.xlsx` differ on every build while the PNG and the PDF
+    stayed byte-stable, so running the suite dirtied the committed fixture — and
+    `test_ensure_fixture_files_is_idempotent` above compared two builds that could
+    straddle a 2-second DOS-timestamp boundary, making it flaky. Build the workbook
+    twice under very different clocks and require identical bytes.
+    """
+    import time
+
+    before = sim_media.make_xlsx_bytes()
+    monkeypatch.setattr(time, "localtime", lambda *a: (2031, 7, 9, 15, 4, 5, 2, 190, 0))
+    after = sim_media.make_xlsx_bytes()
+    assert before == after
+    assert sim_media.make_xlsx_bytes() == before
+
+
+def test_the_committed_xlsx_fixture_matches_a_fresh_build():
+    """The file in the repo must be what the builder produces, or it drifts silently."""
+    committed = (sim_media.FIXTURE_DIR / sim_media.XLSX_NAME).read_bytes()
+    assert committed == sim_media.make_xlsx_bytes()
+
+
+def test_the_committed_fixtures_carry_no_wall_clock_timestamp():
+    """A 1980 stamp is the reproducible-build marker; anything later means a rebuild leaked in."""
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(sim_media.make_xlsx_bytes())) as zf:
+        stamps = {info.date_time for info in zf.infolist()}
+    assert stamps == {(1980, 1, 1, 0, 0, 0)}, stamps
+
+
 def test_media_copied_as_sdkfileid_dot_ext(tmpdir):
     copied = prod.ensure_media(tmpdir)
     assert set(copied) == set(prod.MEDIA)

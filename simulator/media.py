@@ -93,6 +93,25 @@ def make_pdf_bytes(lines: list[str] | None = None) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+# A zip entry with no explicit timestamp is stamped with *the current time*, which
+# makes the workbook differ on every build — unlike the PNG and the PDF, which are
+# pure functions of their arguments. That mattered: `ensure_fixture_files()` writes
+# into `simulator/fixtures/`, so a plain test run dirtied the committed
+# `order-sample.xlsx`, and `test_ensure_fixture_files_is_idempotent` compared bytes
+# across two calls that could straddle a 2-second DOS-timestamp boundary. Pinning the
+# date makes the file reproducible (the same trick reproducible wheel builds use).
+# 1980-01-01 is the earliest date the DOS format can represent.
+_ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
+
+
+def _write_reproducible(zf: zipfile.ZipFile, name: str, data: str) -> None:
+    """Add `data` under `name` with a fixed timestamp and mode."""
+    info = zipfile.ZipInfo(name, date_time=_ZIP_DATE_TIME)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16  # a plain -rw-r--r--
+    zf.writestr(info, data)
+
+
 def _col_letter(index: int) -> str:
     name = ""
     index += 1
@@ -157,11 +176,11 @@ def make_xlsx_bytes(rows: list[list[str]] | None = None) -> bytes:
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", root_rels)
-        zf.writestr("xl/workbook.xml", workbook)
-        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+        _write_reproducible(zf, "[Content_Types].xml", content_types)
+        _write_reproducible(zf, "_rels/.rels", root_rels)
+        _write_reproducible(zf, "xl/workbook.xml", workbook)
+        _write_reproducible(zf, "xl/_rels/workbook.xml.rels", workbook_rels)
+        _write_reproducible(zf, "xl/worksheets/sheet1.xml", sheet)
     return buf.getvalue()
 
 
