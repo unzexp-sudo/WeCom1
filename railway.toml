@@ -3,6 +3,15 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8100}"
-healthcheckPath = "/wecom/health"
+# Liveness, NOT diagnostics. `/wecom/health` calls the ERP over HTTP and runs
+# COUNT(*) queries, so pointing the platform healthcheck at it makes the
+# container's liveness depend on two other services — and
+# `restartPolicyType = "ON_FAILURE"` then turns any blip in either into a
+# restart loop. While the container loops, the edge has no healthy backend and
+# answers `502 Application failed to respond` on EVERY path including `/`,
+# which reads as "the gateway is broken" when the gateway is fine.
+# `/healthz` does no I/O and cannot fail for anyone else's reason.
+# The full picture is still on `/wecom/health` — call it yourself, on purpose.
+healthcheckPath = "/healthz"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"

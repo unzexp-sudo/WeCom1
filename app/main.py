@@ -68,7 +68,20 @@ async def lifespan(_: FastAPI):
         init_db()
     except Exception:  # noqa: BLE001
         logger.exception("startup: init_db FAILED — gateway will start but DB-backed endpoints may 500 until the database is reachable")
-    MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+    # Guarded for the same reason as init_db: a read-only or missing media
+    # volume must degrade attachments, not take the whole gateway down. An
+    # exception raised here escapes `lifespan`, so the app never finishes
+    # starting, uvicorn never binds, and the platform reports
+    # `502 Application failed to respond` on EVERY path — including `/`, which
+    # has nothing to do with media. That is an unwinnable diagnosis from the
+    # outside, so the failure has to be contained and named here instead.
+    try:
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "startup: could not create media dir %s — attachments will fail until "
+            "it is writable", MEDIA_ROOT,
+        )
 
     # --- Session Archive -----------------------------------------------------
     # Two things have to happen here or the customer-order path is dead:
@@ -109,9 +122,24 @@ async def lifespan(_: FastAPI):
     # EMPTY and the library appears at the default location, so guarding on the
     # raw setting would leave the poller stopped on a correctly configured
     # `sdk` deploy — the silent failure this whole path exists to avoid.
-    from app.adapters.wework_sdk import resolved_sdk_path
+    #
+    # The import is guarded too. Every other boot step here is inside a
+    # try/except; an exception escaping `lifespan` means the app never starts
+    # and the platform 502s every path, which is indistinguishable from a
+    # platform outage and was previously the one way boot could die without
+    # leaving a reason in the runtime log.
+    try:
+        from app.adapters.wework_sdk import resolved_sdk_path
 
-    if settings.archive_private_key_path or resolved_sdk_path():
+        sdk_path = resolved_sdk_path()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "startup: could not resolve the SDK path — the archive poller will not "
+            "start; attachments will fail until this is fixed"
+        )
+        sdk_path = ""
+
+    if settings.archive_private_key_path or sdk_path:
         try:
             from app.services.archive import start_poller
 
@@ -199,6 +227,26 @@ def favicon() -> Response:
     Content`` keeps the console clean without shipping a binary asset.
     """
     return Response(status_code=204)
+
+
+@app.get("/healthz", include_in_schema=False)
+def liveness() -> dict:
+    """Zero-I/O liveness probe — this is what the platform healthcheck calls.
+
+    ``/wecom/health`` is a *diagnostic*: it calls the ERP over HTTP, runs two
+    ``COUNT(*)`` queries and builds the whole config-readiness block. Pointing
+    the platform healthcheck at it couples the container's liveness to the ERP
+    and to the database, so a blip in either fails the check — and with
+    ``restartPolicyType = "ON_FAILURE"`` in ``railway.toml`` that becomes a
+    restart loop. While it loops the edge has no healthy backend and answers
+    ``502 Application failed to respond`` on **every** path, ``/`` included,
+    which reads as "the app is broken" when the app is fine.
+
+    So this route proves exactly one thing, and does no work to prove it: the
+    process is up and serving. Keep it that way — no DB session, no settings
+    lookup, no logging. Diagnostics belong on ``/wecom/health``.
+    """
+    return {"status": "ok"}
 
 
 _INDEX_HTML_TEMPLATE = """<!doctype html>
