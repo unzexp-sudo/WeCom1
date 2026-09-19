@@ -46,6 +46,18 @@ class WeComGroup(TimestampMixin):
     is_order_group: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_internal_ops: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    # A group robot's webhook URL. `appchat/send` carries the documented limit
+    # "chatid 所代表的群必须是该应用所创建" — the group must be one the app
+    # created — so a real customer group, made by a member, is unreachable that
+    # way and WeCom answers 86008. A group robot added to the same group posts
+    # in real time with no confirmation step, so this is how we reach it.
+    # Secret: the URL carries a `key` query param. Never log it.
+    webhook_url: Mapped[str | None] = mapped_column(String(1000))
+
+    @property
+    def webhook_bound(self) -> bool:
+        """Whether a group robot is bound — readable, unlike the URL itself."""
+        return bool((self.webhook_url or "").strip())
 
 
 class WeComMessageLog(TimestampMixin):

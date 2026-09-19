@@ -52,6 +52,9 @@ def upsert_group(body: GroupIn, db: Session = Depends(get_db)) -> GroupOut:
     if body.member_userids:
         group.member_userids = list(body.member_userids)
         group.member_count = len(body.member_userids)
+    # An empty string clears the binding, which is the only way to undo one.
+    if body.webhook_url is not None:
+        group.webhook_url = body.webhook_url.strip() or None
 
     db.commit()
     db.refresh(group)

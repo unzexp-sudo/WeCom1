@@ -131,6 +131,7 @@ class GroupIn(BaseModel):
     is_order_group: bool = False
     is_internal_ops: bool = False
     member_userids: list[str] = Field(default_factory=list)
+    webhook_url: str | None = None
 
 
 class GroupOut(BaseModel):
@@ -143,6 +144,10 @@ class GroupOut(BaseModel):
     member_count: int = 0
     is_order_group: bool = False
     is_internal_ops: bool = False
+    # Whether a group robot is bound — NOT the URL. The URL carries a `key`
+    # query param that lets anyone holding it post to the group, so it must
+    # never come back out of a read endpoint.
+    webhook_bound: bool = False
     created_at: datetime
     updated_at: datetime
 

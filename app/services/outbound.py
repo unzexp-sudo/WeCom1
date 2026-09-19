@@ -114,6 +114,21 @@ def resolve_destination(
 # ---------------------------------------------------------------------------
 
 
+def _webhook_for(db: Session, chat_id: str | None) -> str | None:
+    """The group robot URL bound to `chat_id`, or None.
+
+    None means "no robot was added", not "cannot send" — a group the app
+    created still goes through `appchat/send`, which is correct for it.
+    """
+    if not chat_id:
+        return None
+    try:
+        group = db.query(WeComGroup).filter(WeComGroup.chat_id == chat_id).one_or_none()
+    except Exception:  # noqa: BLE001 — a lookup failure means "no robot", not a crash
+        return None
+    return ((getattr(group, "webhook_url", None) or "").strip()) or None
+
+
 def _as_dict(result: Any) -> dict:
     if isinstance(result, dict):
         return result
@@ -223,13 +238,23 @@ def send_message(db: Session, req: SendRequest, *, api=None) -> SendResponse:
         db.flush()  # assign the id before the outbox file is named
 
         client = api or get_wecom_api()
-        if to_type == "user":
+        webhook_url = _webhook_for(db, to_id) if to_type == "group" else None
+        if webhook_url:
+            response = client.send_text_to_webhook(webhook_url, text)
+            transport = "webhook"
+        elif to_type == "user":
             response = client.send_text_to_user(to_id, text)
+            transport = "externalcontact"
         else:
             response = client.send_text_to_group(to_id, text)
+            transport = "appchat"
 
         log.status = "mock" if settings.is_mock else "sent"
-        log.response = _as_dict(response)
+        # Which transport actually carried it. The two can fail for reasons the
+        # other cannot — appchat/send answers 86008 for a customer group, a
+        # webhook fails when no robot was ever added — so "which one ran" is
+        # the first thing to check when a send misbehaves.
+        log.response = {**_as_dict(response), "transport": transport}
 
         if settings.is_mock:
             _write_outbox(f"{req.template}-{log.id}.txt", text)

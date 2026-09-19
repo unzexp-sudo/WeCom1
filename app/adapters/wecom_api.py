@@ -10,6 +10,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 import httpx
 
@@ -112,6 +113,26 @@ class WeComApi(Protocol):
     def send_text_to_user(self, external_userid: str, text: str) -> dict[str, Any]: ...
 
     def send_text_to_group(self, chat_id: str, text: str) -> dict[str, Any]: ...
+
+    def send_text_to_webhook(self, webhook_url: str, text: str) -> dict[str, Any]: ...
+
+
+def _redact_webhook(url: str) -> str:
+    """A group robot's webhook URL is a bearer credential.
+
+    Anyone holding the URL — `key` query param included — can post to the
+    group, so it must never reach a log line, an outbound row or a test
+    assertion. Strip the query and keep just enough to recognise which host
+    was called.
+    """
+    try:
+        parts = urlparse(url or "")
+        if not parts.scheme and not parts.netloc:
+            return "<webhook>"
+        base = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        return f"{base}?<redacted>" if parts.query else base
+    except Exception:  # noqa: BLE001 — redaction must never break a send
+        return "<webhook>"
 
 
 def _client(timeout: float = 30.0) -> httpx.Client:
@@ -257,6 +278,16 @@ class MockWeComApi:
     def send_text_to_group(self, chat_id: str, text: str) -> dict[str, Any]:
         self.sent.append({"to_type": "group", "to_id": chat_id, "text": text})
         return {"errcode": 0, "errmsg": "ok", "mock": True, "to": chat_id}
+
+    def send_text_to_webhook(self, webhook_url: str, text: str) -> dict[str, Any]:
+        # Mirrors the real client's refusal, so a test cannot pass on a URL
+        # that production would reject.
+        if not (webhook_url or "").lower().startswith("https://"):
+            raise WeComApiError("group webhook URL must be https")
+        # Only the scheme+host of the URL is recorded — the `key` param is a
+        # credential and must not land in a mock log or a test assertion.
+        self.sent.append({"to_type": "webhook", "to_id": _redact_webhook(webhook_url), "text": text})
+        return {"errcode": 0, "errmsg": "ok", "mock": True, "to": _redact_webhook(webhook_url)}
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +693,36 @@ class RealWeComApi:
         if data.get("errcode"):
             raise WeComApiError(
                 f"appchat/send failed: {data.get('errcode')} {data.get('errmsg')}"
+            )
+        return data
+
+    def send_text_to_webhook(self, webhook_url: str, text: str) -> dict[str, Any]:
+        """Post through a group robot. No token, no agent, no IP allowlist.
+
+        This is the only way to reach a customer group the app did not create —
+        `appchat/send` answers 86008 for those, and WeCom documents the limit
+        ("chatid 所代表的群必须是该应用所创建"). A robot added to the same group
+        posts in real time with no confirmation step, and because the webhook
+        takes no access_token the app's Trusted IP list does not apply.
+
+        The URL is a credential (its `key` param authorises posting), so it is
+        never logged — see `_redact_webhook`.
+        """
+        if not (webhook_url or "").lower().startswith("https://"):
+            raise WeComApiError("group webhook URL must be https")
+        with _client() as c:
+            r = c.post(webhook_url, json={"msgtype": "text", "text": {"content": text}})
+            body = r.text
+        try:
+            data = json.loads(body)
+        except Exception as exc:  # noqa: BLE001
+            raise WeComApiError(
+                f"group webhook returned a non-JSON body "
+                f"({_redact_webhook(webhook_url)}): {body[:200]!r}"
+            ) from exc
+        if data.get("errcode"):
+            raise WeComApiError(
+                f"group webhook failed: {data.get('errcode')} {data.get('errmsg')}"
             )
         return data
 

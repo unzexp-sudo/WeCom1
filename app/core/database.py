@@ -1,15 +1,18 @@
 """SQLAlchemy engine/session plumbing for the WeCom Gateway."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
+
+logger = logging.getLogger("wecom.database")
 
 
 def _ensure_sqlite_dir(url: str) -> None:
@@ -182,8 +185,33 @@ def get_db():
         db.close()
 
 
+def _ensure_group_webhook_column() -> None:
+    """`create_all` builds a table but never ALTERs an existing one.
+
+    `wecom_groups` is already deployed, so without this a new column shows up
+    as a missing-column error at *send* time rather than at startup — and
+    outbound swallows exceptions by design, so the symptom would be a send that
+    fails silently. Postgres only: SQLite (tests, local dev) is always created
+    fresh by `create_all`, which already carries the column.
+    """
+    url = settings.database_url or ""
+    if not url.startswith(("postgres", "postgresql")):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE wecom_groups "
+                    "ADD COLUMN IF NOT EXISTS webhook_url VARCHAR(1000)"
+                )
+            )
+    except Exception:  # noqa: BLE001 — startup must not die on one column
+        logger.exception("Could not add wecom_groups.webhook_url")
+
+
 def init_db() -> None:
     """Create all tables. Imports models first so they register on Base."""
     from app.models import wecom as _models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _ensure_group_webhook_column()
