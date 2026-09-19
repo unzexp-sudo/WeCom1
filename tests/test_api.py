@@ -190,7 +190,27 @@ def test_health_does_not_warn_about_isolation_when_it_is_on(client, monkeypatch)
     assert not any("WECOM_SDK_ISOLATE" in w for w in warnings)
 
 
-def test_health_warns_that_a_non_sdk_provider_ingests_nothing(client, monkeypatch):
+def _point_autofetch_at_an_empty_dir(monkeypatch, empty_dir):
+    """Make `archive_sdk_present` deterministic instead of machine-dependent.
+
+    These health tests assert the library is *absent*. They used to rely on the
+    default vendor directory never having been populated — which is true on a
+    fresh clone and false on any machine that has actually run the archive,
+    because autofetch downloads the real library there. That made the suite red
+    for the one person whose setup was correct, and it would have gone green
+    again the moment they deleted the file — an assertion whose result depends
+    on the developer's disk is not an assertion. Point the default at an empty
+    temp directory so "absent" means absent everywhere.
+    """
+    from app.adapters import wework_sdk as ws
+
+    monkeypatch.setattr(ws, "DEFAULT_SDK_DIR", empty_dir)
+    return empty_dir / ws.SDK_FILENAME
+
+
+def test_health_warns_that_a_non_sdk_provider_ingests_nothing(
+    client, monkeypatch, tmp_path
+):
     """A non-`sdk` provider ingests NOTHING — not merely attachments.
 
     This test previously asserted the warning said "archived ATTACHMENTS cannot be
@@ -201,6 +221,7 @@ def test_health_warns_that_a_non_sdk_provider_ingests_nothing(client, monkeypatc
     byte-identical to an empty archive — points nowhere near the cause.
     """
     monkeypatch.setattr(settings, "decrypt_provider", "pure")
+    _point_autofetch_at_an_empty_dir(monkeypatch, tmp_path)
 
     body = client.get("/wecom/health").json()
     warnings = body["config"]["warnings"]
@@ -231,12 +252,13 @@ def test_health_reports_the_effective_sdk_path_not_the_raw_setting(
     monkeypatch.setattr(settings, "decrypt_provider", "sdk")
     monkeypatch.setattr(settings, "archive_sdk_path", "")  # autofetch
     monkeypatch.setattr(settings, "archive_sdk_autofetch", True)
+    absent = _point_autofetch_at_an_empty_dir(monkeypatch, tmp_path)
 
     cfg = client.get("/wecom/health").json()["config"]
 
     assert cfg["archive_sdk_path_source"] == "autofetch"
     assert cfg["archive_sdk_path_set"] is True, "the effective path is not reported"
-    assert cfg["archive_sdk_path"] == str(ws.DEFAULT_SDK_DIR / ws.SDK_FILENAME)
+    assert cfg["archive_sdk_path"] == str(absent)
     assert cfg["archive_sdk_present"] is False, "the file is not on disk yet"
 
 
